@@ -739,7 +739,9 @@ pub fn install(usb_dir: &Path) -> Result<Option<Vec<String>>> {
     secure_app_directory(&app)?;
     stop_task();
 
-    if has_task && !baseline_file().exists() {
+    if has_task && baseline_file().exists() {
+        remove_lock().context("existing Chainlink policies could not be restored for repair")?;
+    } else if has_task {
         let old_exe = installed_exe();
         let old_powershell = app.join("watchdog.ps1");
         if old_exe.is_file() {
@@ -887,6 +889,14 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn task_xml(executable: &Path, enabled: bool) -> String {
     let mut time = SYSTEMTIME::default();
     unsafe { GetLocalTime(&mut time) };
@@ -894,13 +904,6 @@ fn task_xml(executable: &Path, enabled: bool) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
     );
-    let escape = |value: &str| {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -909,7 +912,7 @@ fn task_xml(executable: &Path, enabled: bool) -> String {
 <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
 <Settings><Enabled>{enabled}</Enabled><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>
 <Actions Context="Author"><Exec><Command>{}</Command><Arguments>--watchdog</Arguments></Exec></Actions></Task>"#,
-        escape(&executable.display().to_string())
+        xml_escape(&executable.display().to_string())
     )
 }
 
@@ -923,17 +926,37 @@ pub fn query_task_xml() -> Option<String> {
 }
 
 pub fn genuine_task() -> bool {
-    query_task_xml().is_some_and(|xml| {
-        let lower = xml.to_ascii_lowercase();
-        lower.contains(&installed_exe().display().to_string().to_ascii_lowercase())
-            || lower.contains(
-                &app_dir()
-                    .join("watchdog.ps1")
-                    .display()
-                    .to_string()
-                    .to_ascii_lowercase(),
-            )
-    })
+    query_task_xml().is_some_and(|xml| task_xml_is_genuine(&xml))
+}
+
+pub fn task_xml_is_genuine(xml: &str) -> bool {
+    let lower = xml.to_ascii_lowercase();
+    if !lower.contains("<userid>s-1-5-18</userid>") {
+        return false;
+    }
+
+    let rust_command = format!(
+        "<command>{}</command>",
+        xml_escape(&installed_exe().display().to_string()).to_ascii_lowercase()
+    );
+    if lower.contains(&rust_command) && lower.contains("<arguments>--watchdog</arguments>") {
+        return true;
+    }
+
+    let powershell_command = format!(
+        "<command>{}</command>",
+        xml_escape(
+            &system_executable(r"WindowsPowerShell\v1.0\powershell.exe")
+                .display()
+                .to_string()
+        )
+        .to_ascii_lowercase()
+    );
+    lower.contains(&powershell_command)
+        && lower.contains("<arguments>")
+        && lower.contains(
+            &xml_escape(&app_dir().join("watchdog.ps1").display().to_string()).to_ascii_lowercase(),
+        )
 }
 
 pub fn create_task() -> Result<()> {

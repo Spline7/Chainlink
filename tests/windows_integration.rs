@@ -41,6 +41,11 @@ fn generated_task_xml_is_trusted_and_accepted() {
     assert!(xml.contains("<Enabled>false</Enabled>"));
     assert!(xml.contains(&windows::installed_exe().display().to_string()));
     assert!(!xml.contains("%ProgramData%"));
+    assert!(windows::task_xml_is_genuine(&xml));
+    assert!(!windows::task_xml_is_genuine(&format!(
+        "<Task><UserId>S-1-5-21-1</UserId><Description>{}</Description></Task>",
+        windows::installed_exe().display()
+    )));
 
     let task_name = format!(r"\ChainlinkRustValidation-{}", std::process::id());
     let create = Command::new("schtasks.exe")

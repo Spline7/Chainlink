@@ -6,10 +6,10 @@ Started by Chainlink.cmd on the USB drive. Makes no network requests and sends n
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import json
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -42,8 +42,8 @@ USB_ROOT = Path(USB_DIR.anchor)
 KEY_FILE = USB_DIR / "chainlink.key"
 USB_BLOCKLIST = USB_DIR / "blocklist.txt"
 START_MENU = ws.PROGRAM_DATA / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-EMERGENCY_COMMAND = START_MENU / "Chainlink Emergency Uninstall.cmd"
-EMERGENCY_LAUNCHER = START_MENU / "Chainlink Emergency Uninstall.pyw"
+EMERGENCY_SHORTCUT = START_MENU / "Chainlink Emergency Uninstall.lnk"
+MAX_ENTRIES = 2048
 INSTALL_FILES = ("chainlink.py", "chainlink_core.py", "windows_support.py", "watchdog.py")
 PYTHON_FLAGS = ("-I", "-B")  # isolated from PYTHON* variables and per-user site-packages; no .pyc files
 
@@ -125,13 +125,47 @@ def register_recovery_failure() -> None:
     atomic_write_text(recovery_attempts_file(), json.dumps({"failures": failures, "until": time.time() + min(60, 2 ** (failures + 1))}) + "\n")
 
 
+def powershell_executable() -> Path:
+    return ws.system_executable(r"WindowsPowerShell\v1.0\powershell.exe")
+
+
+def run_powershell(script: str) -> None:
+    """Run a short PowerShell script without a window. The script travels encoded, never quoted."""
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    result = ws._run_hidden([str(powershell_executable()), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded])
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip() or "PowerShell reported an error")
+
+
 def run_powershell_watchdog(script: Path, mode: str) -> None:
     """Run a watchdog left by a PowerShell release in one of its one-shot modes."""
-    powershell = ws.system_executable(r"WindowsPowerShell\v1.0\powershell.exe")
-    subprocess.run(
-        [str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), mode],
-        check=True,
-        capture_output=True,
+    result = ws._run_hidden([str(powershell_executable()), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), mode])
+    if result.returncode:
+        raise RuntimeError("the existing PowerShell watchdog could not lift its blocks")
+
+
+def quoted(value: object) -> str:
+    """A PowerShell single-quoted string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def create_emergency_shortcut() -> None:
+    """Start menu shortcut for emergency uninstall.
+
+    The shortcut runs PowerShell (which everyone can read) only to ask for elevation; the
+    elevated Python then opens the program in the protected folder. A real .lnk is used
+    because the Start menu lists shortcuts, and it replaces the one the PowerShell release made.
+    """
+    script = ws.app_file("chainlink.py")
+    arguments = ", ".join(quoted(item) for item in (*PYTHON_FLAGS, f'"{script}"', "--emergency"))
+    elevate = f"Start-Process -FilePath {quoted(pythonw_executable())} -Verb RunAs -ArgumentList @({arguments})"
+    encoded = base64.b64encode(elevate.encode("utf-16-le")).decode("ascii")
+    run_powershell(
+        f"$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut({quoted(EMERGENCY_SHORTCUT)}); "
+        f"$shortcut.TargetPath = {quoted(powershell_executable())}; "
+        f"$shortcut.Arguments = {quoted('-NoProfile -WindowStyle Hidden -EncodedCommand ' + encoded)}; "
+        "$shortcut.Description = 'Remove Chainlink without the USB key, using your recovery words.'; "
+        "$shortcut.Save()"
     )
 
 
@@ -145,12 +179,34 @@ def unlock_installed() -> None:
         ws.remove_lock()
 
 
+def usb_layout_ok() -> bool:
+    """The watchdog only looks for <drive>:\\Chainlink\\chainlink.key.
+
+    Linking from anywhere else would create a key it can never find and lock the PC a few
+    seconds later.
+    """
+    return bool(USB_ROOT.anchor) and str(USB_DIR).lower() == str(USB_ROOT / "Chainlink").lower()
+
+
+def require_trusted_program_folder() -> None:
+    """Refuse to go on when the program folder could have been written by a non-administrator."""
+    app_dir = ws.APP_DIR
+    if (app_dir.exists() or app_dir.is_symlink()) and not ws.is_trusted_directory(app_dir):
+        raise RuntimeError(
+            f"{app_dir} was not created by Chainlink, or another account has been able to change it. "
+            "Nothing in it was used. Delete that folder as Administrator and try again."
+        )
+
+
 def install_chainlink() -> list[str] | None:
-    for name in (*INSTALL_FILES, "emergency_launcher.pyw"):
+    for name in INSTALL_FILES:
         if not (USB_DIR / name).is_file():
             raise RuntimeError(f"the USB is missing Chainlink/{name}")
+    if not usb_layout_ok():
+        raise RuntimeError(f"Chainlink has to be started from the Chainlink folder at the top level of the USB drive (for example E:\\Chainlink). It is running from {USB_DIR}.")
     read_blocklist(USB_BLOCKLIST)
     runtime = validated_runtime()
+    require_trusted_program_folder()
 
     task = ws.query_task_xml()
     has_task = bool(task and ws.task_xml_is_genuine(task))
@@ -163,13 +219,21 @@ def install_chainlink() -> list[str] | None:
     # Program folder that only SYSTEM and Administrators can read or change. Everything in it
     # runs as SYSTEM, so a folder another account created or owns is never reused.
     app_dir = ws.APP_DIR
-    if app_dir.exists() or app_dir.is_symlink():
-        if not app_dir.is_dir() or ws.is_reparse_point(app_dir):
-            raise RuntimeError(f"{app_dir} must be a real directory, not a file, junction, or symbolic link")
-        if not has_task:
-            if any(app_dir.iterdir()):
-                raise RuntimeError(f"{app_dir} already contains files but no Chainlink scheduled task exists; delete that folder as Administrator and link again")
-            app_dir.rmdir()
+    existing = has_task
+    if app_dir.exists():
+        if not existing:
+            if not any(app_dir.iterdir()):
+                app_dir.rmdir()
+            elif ws.is_protected_directory(app_dir) and any(ws.app_file(name).is_file() for name in ("watchdog.py", "watchdog.ps1")):
+                # A Chainlink folder only administrators could have written, whose task is gone
+                # (for example after an interrupted uninstall). Repair it like any other install,
+                # so its blocks are lifted before a new policy baseline could ever be taken.
+                existing = True
+            else:
+                raise RuntimeError(
+                    f"{app_dir} already contains files but no Chainlink scheduled task exists. If Chainlink is installed, "
+                    "use Uninstall (or Chainlink Emergency Uninstall) first; otherwise delete that folder as Administrator, then link again."
+                )
     created = not app_dir.exists()
     if created:
         ws.create_protected_directory(app_dir)
@@ -177,78 +241,95 @@ def install_chainlink() -> list[str] | None:
         ws.protect_existing_directory(app_dir)
 
     try:
-        return install_files(runtime, current_hash, has_task)
+        return install_files(runtime, current_hash, existing)
     except BaseException:
         if created:
             # A first-time link that fails leaves nothing behind, so it can simply be tried again.
+            # The folder goes only once the task is gone: a SYSTEM task must never be left
+            # pointing at a path that any account could then recreate.
             try:
                 ws.stop_task()
                 ws.delete_task()
+                task_gone = ws.query_task_xml() is None
             except Exception:
-                pass
-            EMERGENCY_COMMAND.unlink(missing_ok=True)
-            EMERGENCY_LAUNCHER.unlink(missing_ok=True)
-            shutil.rmtree(app_dir, ignore_errors=True)
+                task_gone = False
+            if task_gone:
+                EMERGENCY_SHORTCUT.unlink(missing_ok=True)
+                shutil.rmtree(app_dir, ignore_errors=True)
         raise
 
 
 def install_files(runtime: Path, current_hash: str, upgrade: bool) -> list[str] | None:
-    new_recovery_words_for_partner = None
     # Hold the watchdog lock while files change, so no watchdog runs a half-replaced copy.
     lock = ws.stop_watchdog()
     try:
+        ws.uninstall_marker().unlink(missing_ok=True)
         if upgrade:
             unlock_installed()  # lift the old copy's blocks before replacing it
 
         for name in INSTALL_FILES:
             copy_atomic(USB_DIR / name, ws.app_file(name))
+        if ws.app_file("policy-baseline.json").exists() and not ws.baseline_file_is_valid():
+            # Unreadable, so the unlock above already fell back to removing Chainlink's own values.
+            ws.app_file("policy-baseline.json").unlink()
         ws.capture_baseline()
-        if ws.read_baseline() is None:
+        if not ws.baseline_file_is_valid():
             raise RuntimeError("could not save existing browser policy; installation stopped")
 
         known = sorted(ws.paired_hashes() | {current_hash})
         atomic_write_text(ws.app_file("pair.txt"), "".join(f"{item}\n" for item in known))
         copy_atomic(USB_BLOCKLIST, ws.app_file("blocklist.txt"))
         read_blocklist(ws.app_file("blocklist.txt"))
-
-        if not recovery_file().exists():
-            new_recovery_words_for_partner = new_recovery_words()
-            write_recovery(new_recovery_words_for_partner)
-
-        # Start menu entry for emergency uninstall. The launcher is readable by everyone and only
-        # asks for elevation; the program it starts stays in the protected folder.
-        copy_atomic(USB_DIR / "emergency_launcher.pyw", EMERGENCY_LAUNCHER)
-        flags = " ".join(PYTHON_FLAGS)
-        command = f'@echo off\r\nstart "" "{pythonw_executable()}" {flags} "{EMERGENCY_LAUNCHER}" "{ws.app_file("chainlink.py")}"\r\n'
-        atomic_write_text(EMERGENCY_COMMAND, command)
+        create_emergency_shortcut()
     finally:
         if lock is not None:
             lock.close()
 
+    # The original release's watchdog takes no lock; make sure none started in the meantime.
+    ws.stop_legacy_watchdogs()
     ws.create_task(runtime, ws.app_file("watchdog.py"))
     for obsolete in ("Chainlink.ps1", "Chainlink.Common.psm1", "watchdog.ps1"):
         ws.app_file(obsolete).unlink(missing_ok=True)
-    return new_recovery_words_for_partner
+
+    # First time on this PC: recovery words for the accountability partner. Made last, so that
+    # if anything above fails the words are not stored without ever being shown.
+    if not recovery_file().exists():
+        words = new_recovery_words()
+        write_recovery(words)
+        return words
+    return None
 
 
 def uninstall_chainlink() -> None:
     # Order matters. First make sure no watchdog is running and none can start (the task fires
     # every minute and would re-apply the blocks behind our back), then lift the blocks, and
     # only then delete the files.
+    require_trusted_program_folder()
     lock = ws.stop_watchdog()
     try:
         ws.delete_task()
         unlock_installed()
+        # Tell any watchdog that was already starting to exit instead of locking again. It can
+        # only get the lock after this point, and it checks for the marker once it has it.
+        if ws.APP_DIR.is_dir():
+            ws.uninstall_marker().write_bytes(b"")
     finally:
         if lock is not None:
             lock.close()
-    EMERGENCY_COMMAND.unlink(missing_ok=True)
-    EMERGENCY_LAUNCHER.unlink(missing_ok=True)
+    EMERGENCY_SHORTCUT.unlink(missing_ok=True)
     app_dir = ws.APP_DIR
     if app_dir.exists():
         if ws.is_reparse_point(app_dir):
             raise RuntimeError("refusing to remove a reparse-point program directory")
-        shutil.rmtree(app_dir)
+        # A watchdog that is just exiting can hold the lock file for a moment; retry briefly.
+        for attempt in range(10):
+            try:
+                shutil.rmtree(app_dir)
+                break
+            except OSError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.5)
 
 
 def blocklist_for_ui() -> tuple[list[str], list[str], bool, list[str]]:
@@ -286,6 +367,8 @@ def blocklist_for_ui() -> tuple[list[str], list[str], bool, list[str]]:
 def save_blocklist(sites: list[str], channels: list[str], shorts: bool) -> None:
     normalized_sites = list(dict.fromkeys(filter(None, (normalize_entry(value) for value in sites))))
     normalized_channels = list(dict.fromkeys(filter(None, (normalize_channel(value) for value in channels))))
+    if len(normalized_sites) + len(normalized_channels) + int(shorts) > MAX_ENTRIES:
+        raise ValidationError(f"the blocklist can hold at most {MAX_ENTRIES:,} entries")
     lines = [
         "# Chainlink blocklist - edit with Chainlink.cmd (or by hand, one entry per line).",
         "# Lines starting with # are ignored.",
@@ -517,12 +600,17 @@ def main() -> int:
     parser.add_argument("--emergency", action="store_true")
     arguments = parser.parse_args()
     if not ws.is_admin():
-        ws.relaunch_elevated([*PYTHON_FLAGS, str(Path(__file__).resolve()), *(["--emergency"] if arguments.emergency else [])])
+        # pythonw has no console window, so the elevated copy shows only the Chainlink window.
+        ws.relaunch_elevated(pythonw_executable(), [*PYTHON_FLAGS, str(Path(__file__).resolve()), *(["--emergency"] if arguments.emergency else [])])
         return 0
-    if arguments.emergency:
-        return emergency_ui()
-    ChainlinkApp().run()
-    return 0
+    try:
+        if arguments.emergency:
+            return emergency_ui()
+        ChainlinkApp().run()
+        return 0
+    except Exception as error:  # under pythonw an uncaught error would otherwise show nothing at all
+        messagebox.showerror("Chainlink", f"Chainlink could not start:\n{error}")
+        return 1
 
 
 if __name__ == "__main__":

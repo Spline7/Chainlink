@@ -39,6 +39,16 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual("example.com:8080", normalize_entry("example.com:8080"))
         self.assertEqual("localhost:3000/app", normalize_entry("localhost:3000/app/"))
 
+    def test_saved_entries_read_back_the_same(self) -> None:
+        for value in ("http://example.com:443/", "https://example.com:80", "www.com", "Example.com:8080/Path/"):
+            once = normalize_entry(value)
+            self.assertEqual(once, normalize_entry(once), value)
+        self.assertEqual("www.com", normalize_entry("www.com"))
+        self.assertEqual("example.com", normalize_entry("http://example.com:443/"))
+        for value in ("https://www.youtube.com/channel/UC123/videos", "youtube.com/c/Name", "https://m.youtube.com/user/Name/about", "@Handle"):
+            shown = normalize_channel(value).removeprefix("youtube.com/")  # what the window shows
+            self.assertEqual(normalize_channel(value), normalize_channel(shown), value)
+
     def test_normalizes_channels(self) -> None:
         self.assertEqual("youtube.com/@SomeCreator", normalize_channel("@SomeCreator"))
         self.assertEqual("youtube.com/channel/UC123", normalize_channel("https://m.youtube.com/channel/UC123/videos"))
@@ -82,8 +92,20 @@ class CryptoAndFileTests(unittest.TestCase):
             path.write_text(token, encoding="utf-16")
             self.assertEqual(token, read_key_token(path))
 
-    def test_pairing_hash_is_stable(self) -> None:
-        self.assertEqual(64, len(pairing_hash("token", "A1B2C3D4")))
+    def test_pairing_hash_matches_the_powershell_release(self) -> None:
+        # Computed by Windows PowerShell 5.1 for the key bytes 0..31 and volume serial A1B2C3D4.
+        token = base64.b64encode(bytes(range(32))).decode()
+        self.assertEqual("e2ea145bb592f6dfa5512ebd1a983190cf9e0e2d1f0824312d75fa5671f1222b", pairing_hash(token, "A1B2C3D4"))
+
+    def test_recovery_records_written_by_the_powershell_releases(self) -> None:
+        # Both records were produced by Windows PowerShell 5.1 (Rfc2898DeriveBytes) for WORDS.
+        original = "AAECAwQFBgcICQoLDA0ODw==:ao/IqI3QyN3XcXb3AtTrpvXicWeAKQM6RTfMoGt4yIs="
+        hardened = "v1:300000:AAECAwQFBgcICQoLDA0ODw==:QrS3i2lBkfHZHIsYQqf8Ykk4+tXmcK4FtXdmDTNTggM="
+        for record in (original, hardened):
+            with self.subTest(record=record):
+                self.assertTrue(verify_recovery_record(record, self.WORDS))
+                self.assertTrue(verify_recovery_record(record, [word.upper() + " " for word in self.WORDS]))
+                self.assertFalse(verify_recovery_record(record, [*self.WORDS[:-1], "barn"]))
 
     def test_firefox_patterns_cover_apex_and_subdomains(self) -> None:
         patterns = firefox_patterns("example.com")

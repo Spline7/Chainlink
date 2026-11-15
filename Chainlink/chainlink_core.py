@@ -88,7 +88,7 @@ def normalize_entry(value: str) -> str:
             host = host.encode("idna").decode("ascii").lower()
         except UnicodeError as error:
             raise ValidationError("invalid website hostname") from error
-        if host.startswith("www."):
+        if host.startswith("www.") and "." in host[4:]:
             host = host[4:]
         labels = host.split(".")
         if any(not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) for label in labels):
@@ -96,8 +96,8 @@ def normalize_entry(value: str) -> str:
     else:
         host = f"[{ip.compressed}]" if ip.version == 6 else str(ip)
 
-    default_port = (parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443)
-    port_text = "" if port is None or default_port else f":{port}"
+    # Default ports are dropped whichever scheme was typed, so a saved entry re-reads the same.
+    port_text = "" if port in (None, 80, 443) else f":{port}"
     path = parsed.path.rstrip("/")
     return f"{host}{port_text}{path}"
 
@@ -109,6 +109,10 @@ def normalize_channel(value: str) -> str:
     match = re.fullmatch(r"@?([A-Za-z0-9._-]{1,100})", value)
     if match:
         return f"youtube.com/@{match.group(1)}"
+    # The window shows saved channels without "youtube.com/", so that form must be accepted back.
+    match = re.fullmatch(r"(channel|c|user)/([A-Za-z0-9._-]{1,128})", value)
+    if match:
+        return f"youtube.com/{match.group(1)}/{match.group(2)}"
 
     entry = re.sub(r"^m\.youtube\.com/", "youtube.com/", normalize_entry(value))
     suffix = r"(?:/(?:videos|shorts|featured|streams|playlists|community|about))?"

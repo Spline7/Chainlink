@@ -58,10 +58,6 @@ kernel32.GetVolumeInformationW.restype = wintypes.BOOL
 kernel32.GetLogicalDrives.restype = wintypes.DWORD
 kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetDriveTypeW.restype = wintypes.UINT
-kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-kernel32.OpenProcess.restype = wintypes.HANDLE
-kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
-kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.LocalFree.argtypes = [ctypes.c_void_p]
 kernel32.LocalFree.restype = ctypes.c_void_p
 advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
@@ -179,9 +175,9 @@ def is_admin() -> bool:
     return bool(shell32.IsUserAnAdmin())
 
 
-def relaunch_elevated(arguments: list[str]) -> bool:
+def relaunch_elevated(executable: Path, arguments: list[str]) -> bool:
     parameters = subprocess.list2cmdline(arguments)
-    result = shell32.ShellExecuteW(None, "runas", sys.executable, parameters, None, 0)
+    result = shell32.ShellExecuteW(None, "runas", str(executable), parameters, None, 1)  # SW_SHOWNORMAL
     return (result or 0) > 32
 
 
@@ -245,6 +241,50 @@ def is_protected_directory(path: Path) -> bool:
     return True
 
 
+def _rights_are_read_only(rights: str) -> bool:
+    """True when an SDDL rights field grants nothing beyond reading and executing."""
+    read_execute = 0x1200A9  # FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+    if rights.lower().startswith("0x"):
+        try:
+            return int(rights, 16) & ~read_execute == 0
+        except ValueError:
+            return False
+    codes = [rights[index:index + 2] for index in range(0, len(rights), 2)]
+    return bool(codes) and all(code in {"FR", "FX", "GR", "GX"} for code in codes)
+
+
+def is_trusted_directory(path: Path) -> bool:
+    """True when nobody but SYSTEM and Administrators could have put or changed anything here.
+
+    The directory and everything in it are owned by them, nothing in it is a link, and any
+    other account has at most read access (the original release let Users read the folder).
+    Uninstall and repair check this before they read state from, or run code in, an existing
+    folder.
+    """
+    if not path.is_dir() or is_reparse_point(path):
+        return False
+    match = re.fullmatch(r"O:(?P<owner>[A-Z0-9-]+?)D:(?P<flags>[A-Z]*)(?P<aces>(?:\([^)]*\))*)", path_sddl(path))
+    if not match or match.group("owner") not in _TRUSTED:
+        return False
+    for ace in re.findall(r"\(([^)]*)\)", match.group("aces")):
+        parts = ace.split(";")
+        if len(parts) != 6:
+            return False
+        if parts[0] == "D" or parts[5] in _TRUSTED:
+            continue
+        if parts[0] != "A" or not _rights_are_read_only(parts[2]):
+            return False
+    for directory, directories, files in os.walk(path):
+        for name in (*directories, *files):
+            child = Path(directory) / name
+            try:
+                if is_reparse_point(child) or not has_trusted_owner(child):
+                    return False
+            except FileNotFoundError:
+                continue  # a temporary file that has since been renamed
+    return True
+
+
 def create_protected_directory(path: Path) -> None:
     """Create the directory with its final owner and ACL in one call.
 
@@ -283,10 +323,13 @@ def protect_existing_directory(path: Path) -> None:
     for directory, directories, files in os.walk(path):
         for name in (*directories, *files):
             child = Path(directory) / name
-            if is_reparse_point(child):
-                raise RuntimeError(f"{child} is a link; remove it and try again")
-            if not has_trusted_owner(child):
-                raise RuntimeError(f"{child} is owned by an account other than SYSTEM or Administrators; remove it and try again")
+            try:
+                if is_reparse_point(child):
+                    raise RuntimeError(f"{child} is a link; remove it and try again")
+                if not has_trusted_owner(child):
+                    raise RuntimeError(f"{child} is owned by an account other than SYSTEM or Administrators; remove it and try again")
+            except FileNotFoundError:
+                continue  # a temporary file that has since been renamed
 
 
 # ---------------------------------------------------------------- watchdog lock
@@ -325,21 +368,39 @@ def watchdog_lock_owner(path: Path) -> int:
         return 0
 
 
-def terminate_process(process_id: int) -> None:
-    terminate, synchronize = 0x0001, 0x00100000
-    handle = kernel32.OpenProcess(terminate | synchronize, False, process_id)
-    if not handle:
+def _run_hidden(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(arguments, capture_output=True, text=True, errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def terminate_watchdog_process(process_id: int) -> None:
+    """End a leftover watchdog. taskkill only acts if that process id really is a Python process."""
+    for image in ("python.exe", "pythonw.exe", "powershell.exe"):
+        _run_hidden([str(system_executable("taskkill.exe")), "/F", "/FI", f"PID eq {process_id}", "/FI", f"IMAGENAME eq {image}"])
+
+
+def stop_legacy_watchdogs() -> None:
+    """End watchdogs of the original PowerShell release, which took no lock."""
+    if not app_file("watchdog.ps1").is_file():
         return
-    try:
-        kernel32.TerminateProcess(handle, 1)
-        kernel32.WaitForSingleObject(handle, 5000)
-    finally:
-        kernel32.CloseHandle(handle)
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | "
+        "Where-Object { $_.CommandLine -like '*Chainlink\\watchdog.ps1*' } | "
+        "ForEach-Object { try { Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction Stop | Out-Null } catch { } }"
+    )
+    _run_hidden([str(system_executable(r"WindowsPowerShell\v1.0\powershell.exe")), "-NoProfile", "-NonInteractive", "-Command", script])
+
+
+def uninstall_marker() -> Path:
+    """Written by uninstall just before it deletes the program folder; tells a watchdog to exit."""
+    return app_file("uninstalling")
 
 
 def stop_watchdog(timeout: float = 15.0) -> BinaryIO | None:
     """Stop the watchdog and return the held lock, or None when there is no program directory."""
-    stop_task()
+    task = query_task_xml()
+    if task and (task_xml_is_genuine(task) or task_xml_references_app_dir(task)):
+        stop_task()
+    stop_legacy_watchdogs()
     if not APP_DIR.is_dir():
         return None
     lock_path = app_file("watchdog.lock")
@@ -350,7 +411,7 @@ def stop_watchdog(timeout: float = 15.0) -> BinaryIO | None:
             return lock
         owner = watchdog_lock_owner(lock_path)
         if owner and owner != os.getpid():
-            terminate_process(owner)
+            terminate_watchdog_process(owner)
         if time.monotonic() > deadline:
             raise RuntimeError("the Chainlink watchdog is still running and could not be stopped; wait a minute and try again")
         time.sleep(0.3)
@@ -488,10 +549,18 @@ def capture_baseline_data() -> dict[str, Any]:
 
 
 def capture_baseline() -> None:
-    if app_file("policy-baseline.json").exists():
+    path = app_file("policy-baseline.json")
+    if path.exists():
         return
-    atomic_write_text(app_file("policy-baseline.json"), json.dumps(capture_baseline_data(), indent=2) + "\n")
+    atomic_write_text(path, json.dumps(capture_baseline_data(), indent=2) + "\n")
     log("Captured pre-install browser policy baseline.")
+
+
+def baseline_file_is_valid() -> bool:
+    try:
+        return baseline_is_valid(json.loads(app_file("policy-baseline.json").read_text(encoding="utf-8-sig")))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _baseline_section(baseline: Any, name: str) -> Any:
@@ -574,14 +643,21 @@ def _for_target(target: Target, entries: list[str]) -> list[str]:
 def apply_lock(entries: list[str], previous: list[str], baseline: Any) -> None:
     """Apply the block. `previous` are entries an earlier lock wrote; they are replaced, not kept."""
     managed_entries = unique(entries, previous)
+    first_error: Exception | None = None
     for target in TARGETS:
-        list_path = _policy_path(target.key, target.list_key)
-        managed = set(_for_target(target, managed_entries))
-        others = [value for value in list_values(list_path) if value not in managed]
-        write_list(list_path, unique(_baseline_list(baseline, target.name), others, _for_target(target, entries)))
-        with _create_key(_policy_path(target.key)) as key:
-            for name, value in target.values.items():
-                winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+        # A failure on one browser must not leave the others unblocked.
+        try:
+            list_path = _policy_path(target.key, target.list_key)
+            managed = set(_for_target(target, managed_entries))
+            others = [value for value in list_values(list_path) if value not in managed]
+            write_list(list_path, unique(_baseline_list(baseline, target.name), others, _for_target(target, entries)))
+            with _create_key(_policy_path(target.key)) as key:
+                for name, value in target.values.items():
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+        except OSError as error:
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error
 
 
 def lift_lock(entries: list[str], baseline: Any) -> None:
@@ -637,10 +713,17 @@ def _write_applied(entries: list[str]) -> None:
 def set_lock() -> None:
     entries = installed_blocklist()
     previous = applied_entries()
-    # Record the entries before writing them, so an interrupted lock can still be undone.
-    _write_applied(unique(previous, entries))
+    # Record the entries before writing them, so an interrupted lock can still be undone. The
+    # record is a convenience for unlock; failing to write it must never stop the lock itself.
+    try:
+        _write_applied(unique(previous, entries))
+    except OSError as error:
+        log(f"Could not record applied entries: {error}", once=True)
     apply_lock(entries, previous, read_baseline())
-    _write_applied(entries)
+    try:
+        _write_applied(entries)
+    except OSError:
+        pass
 
 
 def remove_lock() -> None:
@@ -680,7 +763,8 @@ def paired_hashes() -> set[str]:
 
 def key_matches(key_file: Path, root: str, expected: set[str]) -> bool:
     try:
-        if key_file.stat().st_size > 1024:
+        # The watchdog runs as SYSTEM, so it must not follow a link on the USB to another file.
+        if is_reparse_point(key_file) or key_file.stat().st_size > 1024:
             return False
         token = read_key_token(key_file)
         return any(pairing_hash(token, serial) in expected for serial in volume_serials(root))
@@ -712,6 +796,8 @@ def sync_blocklist(root: Path) -> str:
     """
     source = root / "Chainlink" / "blocklist.txt"
     try:
+        if is_reparse_point(source):
+            return "blocklist.txt on the USB is a link, not a file"
         if source.stat().st_size > MAX_USB_BLOCKLIST_BYTES:
             return "blocklist.txt on the USB is too large"
         data = source.read_bytes()  # validate the same bytes that get installed
@@ -805,7 +891,7 @@ def task_xml(python_executable: Path, watchdog: Path) -> str:
 
 def _schtasks(*arguments: str) -> subprocess.CompletedProcess[str]:
     """The only place that talks to Task Scheduler."""
-    return subprocess.run([str(system_executable("schtasks.exe")), *arguments], text=True, capture_output=True)
+    return _run_hidden([str(system_executable("schtasks.exe")), *arguments])
 
 
 def query_task_xml() -> str | None:

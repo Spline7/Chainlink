@@ -24,6 +24,7 @@ from windows_support import (  # noqa: E402
     log,
     open_watchdog_lock,
     remove_lock,
+    uninstall_marker,
 )
 
 
@@ -48,11 +49,16 @@ def main() -> int:
     if lock is None:  # another watchdog, or an install or uninstall, holds the lock
         return 0
     try:
+        # Checked only after the lock is held: uninstall writes the marker while it holds the
+        # lock, so a watchdog that was already starting can never slip in behind it and lock again.
+        if uninstall_marker().exists():
+            return 0
         log("Watchdog started.")
         watchdog = Watchdog()
-        while True:
+        while not uninstall_marker().exists():
             watchdog.cycle()
             time.sleep(5)
+        return 0
     finally:
         lock.close()
 

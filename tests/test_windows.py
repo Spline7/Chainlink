@@ -274,15 +274,19 @@ class TaskAndDriveTests(unittest.TestCase):
         self.assertIn(reported, serials)
 
 
+def icacls(path: Path, *arguments: str) -> None:
+    subprocess.run([str(ws.system_executable("icacls.exe")), str(path), *arguments], check=True, capture_output=True)
+
+
 @unittest.skipUnless(ws.is_admin(), "needs an elevated prompt to assign the Administrators group as owner")
 class ProtectedDirectoryTests(unittest.TestCase):
-    def test_new_directory_is_protected_and_existing_is_never_adopted(self) -> None:
+    def test_new_directory_is_protected_and_cannot_replace_an_existing_one(self) -> None:
         with tempfile.TemporaryDirectory() as base:
             path = Path(base) / "protected"
             ws.create_protected_directory(path)
             self.assertTrue(ws.is_protected_directory(path))
             self.assertRegex(ws.path_sddl(path), r"^O:BAD:P(AI)?\(A;OICI;FA;;;SY\)\(A;OICI;FA;;;BA\)$")
-            with self.assertRaises(OSError):
+            with self.assertRaises(FileExistsError):
                 ws.create_protected_directory(path)
 
             loose = Path(base) / "loose"
@@ -291,12 +295,32 @@ class ProtectedDirectoryTests(unittest.TestCase):
             ws.protect_existing_directory(loose)
             self.assertTrue(ws.is_protected_directory(loose))
 
+    def test_only_folders_non_administrators_could_not_write_are_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            plain = Path(base) / "plain"
+            plain.mkdir()
+            self.assertFalse(ws.is_trusted_directory(plain), "an ordinary folder under the user's profile")
+
+            path = Path(base) / "protected"
+            ws.create_protected_directory(path)
+            (path / "state.txt").write_text("x")
+            self.assertTrue(ws.is_trusted_directory(path))
+            icacls(path, "/grant", "*S-1-5-32-545:(OI)(CI)RX")
+            self.assertTrue(ws.is_trusted_directory(path), "read access for Users, as in the original release")
+            icacls(path, "/grant", "*S-1-5-32-545:(OI)(CI)M")
+            self.assertFalse(ws.is_trusted_directory(path), "write access for Users")
+
+    def test_rights_parsing(self) -> None:
+        for rights, expected in (("0x1200a9", True), ("FR", True), ("FRFX", True), ("FA", False), ("0x1301bf", False), ("FRFW", False), ("", False), ("0xzz", False)):
+            self.assertEqual(expected, ws._rights_are_read_only(rights), rights)
+
 
 @unittest.skipUnless(ws.is_admin(), "needs an elevated prompt to create the protected folder")
-class InstallTests(unittest.TestCase):
-    """Install, repair, and uninstall with Task Scheduler and policy changes recorded, not performed."""
+class InstallTests(ScratchPolicy):
+    """Install, repair, and uninstall against scratch policy, with Task Scheduler recorded, not used."""
 
     def setUp(self) -> None:
+        super().setUp()
         import chainlink
 
         self.chainlink = chainlink
@@ -306,11 +330,13 @@ class InstallTests(unittest.TestCase):
         self.app = base / "app"
         usb = base / "usb"
         usb.mkdir()
-        for name in (*chainlink.INSTALL_FILES, "emergency_launcher.pyw", "blocklist.txt"):
+        for name in (*chainlink.INSTALL_FILES, "blocklist.txt"):
             (usb / name).write_bytes((SOURCE / name).read_bytes())
         self.calls: list[str] = []
         self.task_xml: str | None = None
         self.fail_create = False
+        self.layout_ok = True
+        real_remove_lock = ws.remove_lock
 
         def create_task(python: Path, watchdog: Path) -> None:
             if self.fail_create:
@@ -323,52 +349,65 @@ class InstallTests(unittest.TestCase):
                 self.calls.append("delete")
                 self.task_xml = None
 
+        def remove_lock() -> None:
+            self.calls.append("unlock")
+            real_remove_lock()
+
         patches = [
             (ws, "APP_DIR", self.app),
-            (ws, "_schtasks", forbidden),
             (ws, "stop_task", lambda: self.calls.append("stop")),
+            (ws, "stop_legacy_watchdogs", lambda: None),
+            (ws, "terminate_watchdog_process", lambda process_id: self.calls.append("terminate")),
             (ws, "create_task", create_task),
             (ws, "delete_task", delete_task),
             (ws, "query_task_xml", lambda: self.task_xml),
-            (ws, "capture_baseline", lambda: (self.calls.append("baseline"), ws.app_file("policy-baseline.json").write_text(json.dumps({"version": 2})))),
-            (ws, "read_baseline", lambda: {"version": 2}),
-            (ws, "remove_lock", lambda: self.calls.append("unlock")),
+            (ws, "remove_lock", remove_lock),
             (chainlink, "run_powershell_watchdog", lambda script, mode: self.calls.append(f"powershell {mode}")),
             (chainlink, "validated_runtime", lambda: Path(sys.executable)),
+            (chainlink, "usb_layout_ok", lambda: self.layout_ok),
             (chainlink, "USB_DIR", usb),
-            (chainlink, "USB_ROOT", Path(Path(os.environ.get("SystemDrive", "C:") + "\\"))),
+            (chainlink, "USB_ROOT", Path(os.environ.get("SystemDrive", "C:") + "\\")),
             (chainlink, "KEY_FILE", usb / "chainlink.key"),
             (chainlink, "USB_BLOCKLIST", usb / "blocklist.txt"),
-            (chainlink, "EMERGENCY_COMMAND", base / "Chainlink Emergency Uninstall.cmd"),
-            (chainlink, "EMERGENCY_LAUNCHER", base / "Chainlink Emergency Uninstall.pyw"),
+            (chainlink, "EMERGENCY_SHORTCUT", base / "Chainlink Emergency Uninstall.lnk"),
         ]
         for target, name, value in patches:
             patcher = mock.patch.object(target, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_prefilled_folder_is_never_adopted(self) -> None:
+    def test_folder_chainlink_did_not_create_is_never_used(self) -> None:
         self.app.mkdir()
         (self.app / "watchdog.py").write_text("planted")
-        with self.assertRaises(RuntimeError):
+        (self.app / "watchdog.ps1").write_text("planted")
+        with self.assertRaisesRegex(RuntimeError, "another account"):
             self.chainlink.install_chainlink()
+        with self.assertRaisesRegex(RuntimeError, "another account"):
+            self.chainlink.uninstall_chainlink()
+        self.assertEqual([], self.calls, "nothing may be run from, or because of, an untrusted folder")
         self.assertEqual("planted", (self.app / "watchdog.py").read_text())
 
     def test_failed_first_link_leaves_nothing_behind(self) -> None:
         self.fail_create = True
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "simulated"):
             self.chainlink.install_chainlink()
         self.assertFalse(self.app.exists())
-        self.assertFalse(self.chainlink.EMERGENCY_COMMAND.exists())
-        self.assertFalse(self.chainlink.EMERGENCY_LAUNCHER.exists())
+        self.assertFalse(self.chainlink.EMERGENCY_SHORTCUT.exists())
 
     def test_foreign_task_blocks_linking_and_is_left_alone(self) -> None:
         self.task_xml = '<Task><Principals><Principal><UserId>S-1-5-18</UserId></Principal></Principals><Actions><Exec><Command>C:\\Windows\\System32\\cmd.exe</Command><Arguments>/c exit</Arguments></Exec></Actions></Task>'
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "does not belong"):
             self.chainlink.install_chainlink()
         self.assertFalse(self.app.exists())
         ws.delete_task()
         self.assertIsNotNone(self.task_xml)
+        self.assertEqual([], self.calls, "a foreign task is neither stopped nor deleted")
+
+    def test_linking_from_outside_the_usb_chainlink_folder_is_refused(self) -> None:
+        self.layout_ok = False
+        with self.assertRaisesRegex(RuntimeError, "top level"):
+            self.chainlink.install_chainlink()
+        self.assertFalse(self.app.exists())
 
     def test_link_repair_and_uninstall(self) -> None:
         chainlink = self.chainlink
@@ -377,48 +416,84 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(ws.is_protected_directory(self.app))
         for name in (*chainlink.INSTALL_FILES, "blocklist.txt", "pair.txt", "recovery.txt", "policy-baseline.json"):
             self.assertTrue((self.app / name).is_file(), name)
+        self.assertTrue(ws.baseline_file_is_valid())
         self.assertRegex((self.app / "pair.txt").read_text().strip(), r"^[0-9a-f]{64}$")
-        self.assertIn("-I -B", chainlink.EMERGENCY_COMMAND.read_text())
-        self.assertEqual(["stop", "baseline", "create"], self.calls)
+        self.assertTrue(chainlink.EMERGENCY_SHORTCUT.is_file(), "a real Start menu shortcut")
+        self.assertEqual(["create"], self.calls)
         self.assertTrue(chainlink.usb_matches_pc())
         record = chainlink.recovery_file().read_text()
         self.assertTrue(chainlink.verify_recovery_record(record, words))
         chainlink.register_recovery_failure()
         self.assertGreater(chainlink.recovery_delay(), 0)
 
-        # Repair keeps the recovery words and lifts the old copy's blocks first.
+        # Lock for real (against the scratch key). Repair keeps the recovery words and lifts the blocks first.
+        ws.set_lock()
+        self.assertTrue(ws.lock_intact())
         self.calls.clear()
         self.assertIsNone(chainlink.install_chainlink())
         self.assertEqual(record, chainlink.recovery_file().read_text())
-        self.assertEqual(["stop", "unlock", "baseline", "create"], self.calls)
+        self.assertEqual(["stop", "unlock", "create"], self.calls)
+        self.assertEqual([], self.subkeys(), "repair lifts the blocks")
 
-        # While a watchdog holds the lock, uninstall must not touch anything.
+        # A damaged baseline is replaced during repair instead of blocking it for good.
+        ws.app_file("policy-baseline.json").write_text("{ not json")
+        chainlink.install_chainlink()
+        self.assertTrue(ws.baseline_file_is_valid())
+
+        # The task is gone but the protected folder remains (interrupted uninstall): repair works.
+        self.task_xml = None
+        self.calls.clear()
+        chainlink.install_chainlink()
+        self.assertEqual(["unlock", "create"], self.calls)
+
+        # While something else holds the lock and cannot be stopped, uninstall must not touch anything.
+        ws.set_lock()
         held = ws.open_watchdog_lock(ws.app_file("watchdog.lock"))
         try:
             self.calls.clear()
             with mock.patch.object(ws.time, "monotonic", side_effect=[0.0, 100.0, 200.0]), self.assertRaises(RuntimeError):
                 chainlink.uninstall_chainlink()
             self.assertEqual(["stop"], self.calls)
+            self.assertTrue(ws.lock_intact())
         finally:
             held.close()
 
-        # Uninstall: task first, then unlock, then files.
+        # Uninstall: task first, then the blocks, then the files.
         self.calls.clear()
         chainlink.uninstall_chainlink()
         self.assertEqual(["stop", "delete", "unlock"], self.calls)
+        self.assertEqual([], self.subkeys())
         self.assertFalse(self.app.exists())
-        self.assertFalse(chainlink.EMERGENCY_COMMAND.exists())
+        self.assertFalse(chainlink.EMERGENCY_SHORTCUT.exists())
+
+    def test_leftover_watchdog_holding_the_lock_is_ended(self) -> None:
+        self.chainlink.install_chainlink()
+        holder = subprocess.Popen([sys.executable, "-I", "-c", "import sys, time; sys.path.insert(0, sys.argv[1]); import windows_support as ws; from pathlib import Path; lock = ws.open_watchdog_lock(Path(sys.argv[2])); print('held', flush=True); time.sleep(60)", str(SOURCE), str(ws.app_file("watchdog.lock"))], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual("held", holder.stdout.readline().strip())
+            self.assertEqual(holder.pid, ws.watchdog_lock_owner(ws.app_file("watchdog.lock")))
+            with mock.patch.object(ws, "terminate_watchdog_process", lambda process_id: (self.calls.append(f"terminate {process_id == holder.pid}"), holder.kill(), holder.wait())):
+                self.calls.clear()
+                self.chainlink.uninstall_chainlink()
+            self.assertIn("terminate True", self.calls)
+            self.assertFalse(self.app.exists())
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
 
     def test_upgrade_from_the_original_powershell_release(self) -> None:
         ws.create_protected_directory(self.app)
         script = self.app / "watchdog.ps1"
         script.write_text("# original watchdog")
+        icacls(self.app, "/grant", "*S-1-5-32-545:(OI)(CI)RX")  # the original let Users read the folder
         legacy = f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script}"'
         from xml.sax.saxutils import escape
         self.task_xml = f'<Task><Principals><Principal><UserId>S-1-5-18</UserId></Principal></Principals><Actions><Exec><Command>powershell.exe</Command><Arguments>{escape(legacy)}</Arguments></Exec></Actions></Task>'
         self.chainlink.install_chainlink()
-        self.assertEqual(["stop", "powershell -Unlock", "baseline", "create"], self.calls)
+        self.assertEqual(["stop", "powershell -Unlock", "create"], self.calls)
         self.assertFalse(script.exists())
+        self.assertTrue(ws.is_protected_directory(self.app), "the upgrade closes the folder to Users")
 
 
 class UiSmokeTests(unittest.TestCase):
@@ -450,8 +525,13 @@ class UiSmokeTests(unittest.TestCase):
 
                     app.sites.delete("1.0", "end")
                     app.sites.insert("1.0", "https://www.Example.com/\n*.second.example\n")
+                    app.channels.insert("end", "\nhttps://www.youtube.com/channel/UC123/videos")
                     self.assertTrue(app.save(announce=False))
-                    self.assertEqual(["example.com", "second.example", "youtube.com/shorts", "youtube.com/@SomeCreator"], ws.read_blocklist(blocklist))
+                    expected = ["example.com", "second.example", "youtube.com/shorts", "youtube.com/@SomeCreator", "youtube.com/channel/UC123"]
+                    self.assertEqual(expected, ws.read_blocklist(blocklist))
+                    self.assertEqual(["@SomeCreator", "channel/UC123"], app.lines(app.channels))
+                    self.assertTrue(app.save(announce=False), "what the window shows can be saved again")
+                    self.assertEqual(expected, ws.read_blocklist(blocklist))
                     self.assertEqual(app.saved, app.snapshot())
                 finally:
                     app.root.destroy()

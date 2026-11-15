@@ -1,0 +1,5 @@
+# Per-USB secret and local artifacts
+Chainlink/chainlink.key
+*.tmp
+*.log
+

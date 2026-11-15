@@ -27,8 +27,11 @@ $PairFile      = Join-Path $AppDir 'pair.txt'
 $TaskName      = 'Chainlink'
 $ShortsEntry   = 'youtube.com/shorts'
 $RecoveryFile  = Join-Path $AppDir 'recovery.txt'
+$RecoveryAttemptsFile = Join-Path $AppDir 'recovery-attempts.txt'
 $ShortcutPath  = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Chainlink Emergency Uninstall.lnk'
 $WordCount     = 6
+$CommonModule  = Join-Path $PSScriptRoot 'Chainlink.Common.psm1'
+Import-Module $CommonModule -Force
 
 # Recovery words are picked from this list.
 $WordList = @(
@@ -58,16 +61,18 @@ function Test-Admin {
 }
 
 function Get-Hash([string]$text) {
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))
-    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    return Get-ChainlinkSha256Hex $text
 }
 
 function Get-UsbHash {
     if (-not (Test-Path -LiteralPath $KeyFile)) { return $null }
     $token  = (Get-Content -LiteralPath $KeyFile -Raw).Trim()
+    try { $keyBytes = [Convert]::FromBase64String($token) } catch { return $null }
+    if ($keyBytes.Length -ne 32) { return $null }
     $letter = $UsbRoot.TrimEnd('\')
-    $serial = (Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$letter'").VolumeSerialNumber
+    if ($letter -notmatch '^[A-Za-z]:$') { return $null }
+    $serial = [string](Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$letter'").VolumeSerialNumber
+    if ([string]::IsNullOrWhiteSpace($serial)) { return $null }
     return Get-Hash "$token|$serial"
 }
 
@@ -84,22 +89,13 @@ function Test-UsbMatchesPc {
 
 # Cleans a website entry: "https://www.MangaDex.org/" -> "mangadex.org"
 function Format-Site([string]$s) {
-    $s = $s.Trim() -replace '^[a-zA-Z]+://', '' -replace '^www\.', '' -replace '/+$', ''
-    $slash = $s.IndexOf('/')
-    if ($slash -lt 0) { return $s.ToLower() }
-    return $s.Substring(0, $slash).ToLower() + $s.Substring($slash)
+    return ConvertTo-ChainlinkEntry $s
 }
 
 # Cleans a channel entry. Accepts "@Name", "Name", or any link to the channel.
 # Returns "youtube.com/@Name" or "youtube.com/channel/UC...".
 function Format-Channel([string]$s) {
-    $s = $s.Trim() -replace '^[a-zA-Z]+://', '' -replace '^(www\.|m\.)', ''
-    if ($s -eq '') { return '' }
-    if ($s -match '^youtube\.com/(@[^/?#\s]+)')             { return "youtube.com/$($Matches[1])" }
-    if ($s -match '^youtube\.com/(channel|c|user)/([^/?#\s]+)') { return "youtube.com/$($Matches[1])/$($Matches[2])" }
-    if ($s -match '^(channel|c|user)/([^/?#\s]+)')           { return "youtube.com/$($Matches[1])/$($Matches[2])" }
-    if ($s -match '^@?([^/?#\s]+)$')                          { return "youtube.com/@$($Matches[1])" }
-    return $s
+    return ConvertTo-ChainlinkChannel $s
 }
 
 # Splits blocklist.txt into websites, channels, and the Shorts on/off switch.
@@ -130,7 +126,7 @@ function Save-Blocklist([string[]]$sites, [string[]]$channels, [bool]$shorts) {
     $out += '# YouTube'
     if ($shorts) { $out += $ShortsEntry }
     $out += @($channels | ForEach-Object { Format-Channel $_ } | Where-Object { $_ -ne '' } | Select-Object -Unique)
-    Set-Content -LiteralPath $BlocklistPath -Value $out
+    Set-ChainlinkTextFileAtomic -Path $BlocklistPath -Lines $out
 }
 
 # ================================================================ recovery words
@@ -138,27 +134,63 @@ function Save-Blocklist([string[]]$sites, [string[]]$channels, [bool]$shorts) {
 # Picks $WordCount random words. The list has exactly 256 words, so one random byte = one fair pick.
 function New-RecoveryWords {
     $bytes = New-Object byte[] $WordCount
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     return @($bytes | ForEach-Object { $WordList[$_] })
 }
 
-function Get-PhraseHash([string[]]$words, [byte[]]$salt) {
+function Get-PhraseHash([string[]]$words, [byte[]]$salt, [int]$rounds = 300000) {
     $phrase = (@($words | ForEach-Object { $_.Trim().ToLower() }) -join ' ')
-    $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($phrase, $salt, 100000)
-    return [Convert]::ToBase64String($kdf.GetBytes(32))
+    $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($phrase, $salt, $rounds)
+    try { return $kdf.GetBytes(32) } finally { $kdf.Dispose() }
 }
 
 # Stores only a salted, slow hash of the words on this PC - never the words themselves.
 function Save-RecoveryWords([string[]]$words) {
     $salt = New-Object byte[] 16
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($salt)
-    Set-Content -Path $RecoveryFile -Value ([Convert]::ToBase64String($salt) + ':' + (Get-PhraseHash $words $salt))
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($salt) } finally { $rng.Dispose() }
+    $rounds = 300000
+    $hash = [Convert]::ToBase64String((Get-PhraseHash $words $salt $rounds))
+    Set-ChainlinkTextFileAtomic -Path $RecoveryFile -Lines @("v1:${rounds}:$([Convert]::ToBase64String($salt)):$hash")
 }
 
 function Test-RecoveryWords([string[]]$words) {
-    if (-not (Test-Path $RecoveryFile)) { return $false }
-    $parts = (Get-Content $RecoveryFile -Raw).Trim().Split(':')
-    return ((Get-PhraseHash $words ([Convert]::FromBase64String($parts[0]))) -eq $parts[1])
+    if (-not (Test-Path -LiteralPath $RecoveryFile -PathType Leaf)) { return $false }
+    try {
+        $parts = (Get-Content -LiteralPath $RecoveryFile -Raw).Trim().Split(':')
+        if ($parts.Count -eq 2) {
+            $rounds = 100000; $saltText = $parts[0]; $hashText = $parts[1]
+        } elseif ($parts.Count -eq 4 -and $parts[0] -eq 'v1') {
+            $rounds = [int]$parts[1]; $saltText = $parts[2]; $hashText = $parts[3]
+            if ($rounds -lt 100000 -or $rounds -gt 2000000) { return $false }
+        } else { return $false }
+        $salt = [Convert]::FromBase64String($saltText)
+        $expected = [Convert]::FromBase64String($hashText)
+        if ($salt.Length -ne 16 -or $expected.Length -ne 32) { return $false }
+        return Test-ChainlinkFixedTimeEqual (Get-PhraseHash $words $salt $rounds) $expected
+    } catch { return $false }
+}
+
+function Get-RecoveryDelaySeconds {
+    if (-not (Test-Path -LiteralPath $RecoveryAttemptsFile -PathType Leaf)) { return 0 }
+    try {
+        $parts = (Get-Content -LiteralPath $RecoveryAttemptsFile -Raw).Trim().Split(':')
+        if ($parts.Count -ne 2) { return 0 }
+        $until = [DateTime]::FromBinary([int64]$parts[1])
+        return [Math]::Max(0, [Math]::Ceiling(($until.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds))
+    } catch { return 0 }
+}
+
+function Register-RecoveryFailure {
+    $failures = 0
+    if (Test-Path -LiteralPath $RecoveryAttemptsFile -PathType Leaf) {
+        try { $failures = [int]((Get-Content -LiteralPath $RecoveryAttemptsFile -Raw).Trim().Split(':')[0]) } catch { $failures = 0 }
+    }
+    $failures = [Math]::Min(6, $failures + 1)
+    $delay = [Math]::Min(60, [Math]::Pow(2, $failures + 1))
+    $until = [DateTime]::UtcNow.AddSeconds($delay).ToBinary()
+    Set-ChainlinkTextFileAtomic -Path $RecoveryAttemptsFile -Lines @("${failures}:$until")
 }
 
 # ================================================================ link / uninstall
@@ -167,24 +199,52 @@ function Install-Chainlink {
     # 1. Create the secret key file on the USB the first time (reused for every PC you link).
     if (-not (Test-Path -LiteralPath $KeyFile)) {
         $bytes = New-Object byte[] 32
-        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-        Set-Content -LiteralPath $KeyFile -Value ([Convert]::ToBase64String($bytes)) -NoNewline
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        [IO.File]::WriteAllText($KeyFile, [Convert]::ToBase64String($bytes), [Text.Encoding]::ASCII)
         $kf = Get-Item -LiteralPath $KeyFile -Force
         $kf.Attributes = $kf.Attributes -bor [IO.FileAttributes]::Hidden
     }
 
     # 2. Program folder that only SYSTEM and Administrators can change.
-    if (-not (Test-Path $AppDir)) { New-Item -ItemType Directory -Path $AppDir | Out-Null }
+    if (Test-Path -LiteralPath $AppDir) {
+        $appItem = Get-Item -LiteralPath $AppDir -Force
+        if (-not $appItem.PSIsContainer -or ($appItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "$AppDir must be a real directory, not a file, junction, or symbolic link."
+        }
+    } else { New-Item -ItemType Directory -Path $AppDir | Out-Null }
     & icacls.exe $AppDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not secure the Chainlink program directory.' }
+
+    # Stop the old copy before replacing it. On an upgrade from the original release,
+    # first unlock with that copy so the new watchdog can capture a clean policy baseline.
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+    $installedWatchdog = Join-Path $AppDir 'watchdog.ps1'
+    $baselinePath = Join-Path $AppDir 'policy-baseline.json'
+    if (-not (Test-Path -LiteralPath $baselinePath) -and (Test-Path -LiteralPath $installedWatchdog)) {
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installedWatchdog -Unlock
+        if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the existing installation for upgrade.' }
+    }
+
+    Copy-Item -LiteralPath (Join-Path $UsbDir 'Chainlink.Common.psm1') -Destination $AppDir -Force
+    Copy-Item -LiteralPath (Join-Path $UsbDir 'watchdog.ps1') -Destination $AppDir -Force
+    if (-not (Test-Path -LiteralPath $baselinePath)) {
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $AppDir 'watchdog.ps1') -CaptureBaseline
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $baselinePath)) {
+            throw 'Could not save the existing browser policies; installation was stopped to avoid overwriting them.'
+        }
+    }
 
     # 3. Remember this USB (only a hash is stored, never the key itself).
     $hash = Get-UsbHash
     $known = @()
-    if (Test-Path $PairFile) { $known = @(Get-Content $PairFile | ForEach-Object { $_.Trim() }) }
-    if ($known -notcontains $hash) { Add-Content -Path $PairFile -Value $hash }
+    if (-not $hash) { throw 'Could not validate the USB key and volume serial number.' }
+    if (Test-Path -LiteralPath $PairFile) { $known = @(Get-Content -LiteralPath $PairFile | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -match '^[a-f0-9]{64}$' }) }
+    if ($known -notcontains $hash) { $known += $hash }
+    Set-ChainlinkTextFileAtomic -Path $PairFile -Lines @($known | Select-Object -Unique)
 
     # 4. Copy the background watchdog, the blocklist, and this program (for emergency uninstall) to this PC.
-    Copy-Item -LiteralPath (Join-Path $UsbDir 'watchdog.ps1') -Destination $AppDir -Force
     Copy-Item -LiteralPath $BlocklistPath -Destination $AppDir -Force
     if ($PSCommandPath -ne (Join-Path $AppDir 'Chainlink.ps1')) {
         Copy-Item -LiteralPath $PSCommandPath -Destination $AppDir -Force
@@ -200,7 +260,6 @@ function Install-Chainlink {
     $lnk.Save()
 
     # 5. Scheduled task: starts at boot, and every minute makes sure it is still running.
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AppDir\watchdog.ps1`""
     $atBoot = New-ScheduledTaskTrigger -AtStartup
@@ -230,12 +289,14 @@ function Uninstall-Chainlink {
         ForEach-Object { Invoke-CimMethod -InputObject $_ -MethodName Terminate | Out-Null }
 
     # Remove every browser block using the watchdog's own unlock routine.
-    $wd = Join-Path $UsbDir 'watchdog.ps1'
-    if (-not (Test-Path $wd)) { $wd = Join-Path $AppDir 'watchdog.ps1' }
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $wd -Unlock
+    $wd = Join-Path $AppDir 'watchdog.ps1'
+    if (-not (Test-Path -LiteralPath $wd)) { $wd = Join-Path $UsbDir 'watchdog.ps1' }
+    if (-not (Test-Path -LiteralPath $wd)) { throw 'The installed watchdog is missing; browser policies were not changed.' }
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $wd -Unlock
+    if ($LASTEXITCODE -ne 0) { throw 'Could not restore browser policies; Chainlink files were left in place for recovery.' }
 
-    if (Test-Path $ShortcutPath) { Remove-Item $ShortcutPath -Force }
-    if (Test-Path $AppDir) { Remove-Item $AppDir -Recurse -Force }
+    if (Test-Path -LiteralPath $ShortcutPath) { Remove-Item -LiteralPath $ShortcutPath -Force }
+    if (Test-Path -LiteralPath $AppDir) { Remove-Item -LiteralPath $AppDir -Recurse -Force }
 }
 
 # ================================================================ window
@@ -378,11 +439,13 @@ function Show-EmergencyForm {
     $go.Add_Click({
         $entered = @($boxes | ForEach-Object { $_.Text.Trim() })
         if (@($entered | Where-Object { $_ -eq '' }).Count -gt 0) { $msg.Text = "Please fill in all $WordCount words."; return }
+        $remaining = Get-RecoveryDelaySeconds
+        if ($remaining -gt 0) { $msg.Text = "Please wait $remaining seconds before trying again."; return }
         $f.UseWaitCursor = $true; $go.Enabled = $false
         $ok = Test-RecoveryWords $entered
-        if (-not $ok) { Start-Sleep -Seconds 3 }   # slows down guessing
+        if (-not $ok) { Register-RecoveryFailure; Start-Sleep -Seconds 1 }
         $f.UseWaitCursor = $false; $go.Enabled = $true
-        if ($ok) { $f.Tag = $true; $f.Close() }
+        if ($ok) { Remove-Item -LiteralPath $RecoveryAttemptsFile -Force -ErrorAction SilentlyContinue; $f.Tag = $true; $f.Close() }
         else { $msg.Text = 'Those words do not match. Check the spelling and the order.' }
     })
 
@@ -395,9 +458,8 @@ function Show-EmergencyForm {
 if ($Emergency) {
     if (-not (Test-Installed)) { Show-Message 'Chainlink is not installed on this PC.'; exit 0 }
     if (-not (Test-Path $RecoveryFile)) {
-        # Linked before recovery words existed: fall back to a plain confirmation.
-        $r = [Windows.Forms.MessageBox]::Show('This PC has no recovery words set up. Remove Chainlink anyway?', 'Chainlink', 'YesNo', 'Warning')
-        if ($r -ne 'Yes') { exit 0 }
+        Show-Message 'This installation has no recovery words. Plug in its paired USB, open Chainlink, and choose "Repair / update this PC" before using emergency uninstall.' 'Warning'
+        exit 1
     } elseif (-not (Show-EmergencyForm)) { exit 0 }
     try {
         Uninstall-Chainlink
@@ -493,14 +555,17 @@ function Update-Status {
     if (-not (Test-Installed)) {
         $status.Text = 'This PC is not linked yet. Click "Link this PC" to start.'
         $status.ForeColor = $grey
+        $linkBtn.Text = 'Link this PC'
         $linkBtn.Enabled = $true; $uninstallBtn.Enabled = $false; $wordsBtn.Enabled = $false
     } elseif (Test-UsbMatchesPc) {
         $status.Text = 'This PC is linked to this USB. Blocks are OFF while it is plugged in.'
         $status.ForeColor = [Drawing.Color]::FromArgb(20, 130, 60)
-        $linkBtn.Enabled = $false; $uninstallBtn.Enabled = $true; $wordsBtn.Enabled = $true
+        $linkBtn.Text = 'Repair / update this PC'
+        $linkBtn.Enabled = $true; $uninstallBtn.Enabled = $true; $wordsBtn.Enabled = $true
     } else {
         $status.Text = 'This PC is linked to a different USB key.'
         $status.ForeColor = [Drawing.Color]::FromArgb(190, 60, 30)
+        $linkBtn.Text = 'Link this PC'
         $linkBtn.Enabled = $false; $uninstallBtn.Enabled = $false; $wordsBtn.Enabled = $false
     }
 }

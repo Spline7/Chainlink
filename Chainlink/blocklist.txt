@@ -1,0 +1,15 @@
+# Chainlink blocklist
+# One site or page per line. Lines starting with # are ignored.
+#
+#   mangadex.org              blocks the whole site, including every sub-page and subdomain
+#   youtube.com/shorts        blocks every YouTube Short
+#   youtube.com/@SomeChannel  blocks that channel's page (copy the handle exactly as it appears)
+#
+# To change this list: plug in your Chainlink USB, edit and save this file,
+# then leave the USB plugged in for about 10 seconds so your PC picks up the change.
+
+mangadex.org
+youtube.com/shorts
+
+# Add YouTube channels below (remove the # to turn a line on):
+# youtube.com/@ChannelHandleHere

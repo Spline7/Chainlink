@@ -54,7 +54,9 @@ Plug in the USB and double-click **Chainlink.cmd**. The window has:
 
 Click **Save blocklist**, then leave the USB plugged in for about 10 seconds so the PC copies the new list. If you close the window with unsaved changes, it asks whether to save.
 
-Entries must be ordinary HTTP or HTTPS hostnames, with an optional path. Chainlink rejects credentials, query strings, fragments, malformed URLs, overly long entries, and blocklists above 2,048 entries instead of passing ambiguous input to browser policy.
+Entries must be ordinary HTTP or HTTPS hostnames, with an optional port and path. `*.example.com` and `example.com/*` are accepted and mean the same as `example.com`. Chainlink rejects credentials, query strings, fragments, malformed URLs, overly long entries, and blocklists above 2,048 entries instead of passing ambiguous input to browser policy.
+
+If `blocklist.txt` on the USB has a line Chainlink cannot use (for example after a typo in Notepad), your key still unlocks the PC. The PC keeps its last good list until the file is fixed, and the Chainlink window shows the bad lines so you can correct them. Firefox reads at most 1,000 patterns, and each entry takes two to six, so very long lists are only fully enforced in Chrome, Edge, and Brave.
 
 The list is stored in `Chainlink\blocklist.txt` on the USB, so you can also edit it in Notepad.
 
@@ -67,7 +69,7 @@ The list is stored in `Chainlink\blocklist.txt` on the USB, so you can also edit
 
 This removes the background task, every browser block, and the program folder (`C:\ProgramData\Chainlink`). Your USB keeps working for any other PCs it's linked to.
 
-Chainlink records the browser-policy values that existed before installation. Unlock and uninstall restore those values and preserve unrelated blocklist entries added later; they do not simply delete the browser's whole policy tree.
+Chainlink records the browser-policy values that existed before installation, and the exact entries it writes each time it locks. Unlock and uninstall remove only those entries, restore the earlier values, and preserve unrelated blocklist entries added later; they do not simply delete the browser's whole policy tree.
 
 ### Lost or broken USB: recovery words
 
@@ -90,10 +92,10 @@ If your partner loses the words, plug in your USB, open Chainlink, and click **N
 - Every **5 seconds** the watchdog checks the connected drives for a valid key:
   - **Not found:** it writes the blocklist into the browsers' policy settings in the registry (`URLBlocklist` for Chrome/Edge/Brave, `WebsiteFilter` for Firefox). It also turns off Incognito/InPrivate, guest mode, and adding profiles. About once a minute it checks whether those settings were changed and puts them back.
   - **Found:** it removes those settings and copies `blocklist.txt` from the USB if the file changed.
-- Only SYSTEM and Administrators can modify `C:\ProgramData\Chainlink`.
-- **Recovery words** are 6 words picked at random from a built-in list of 256. The PC stores only a salted, slow hash of them (PBKDF2, 100,000 rounds), never the words themselves.
-- New installations use 300,000 PBKDF2 rounds and a versioned recovery record. Existing 100,000-round records remain usable until you choose **New recovery words**.
-- Invalid key files, unreadable state, and watchdog-cycle errors fail closed: Chainlink tries to apply the blocklist and records the error in `C:\ProgramData\Chainlink\log.txt`.
+- Only SYSTEM and Administrators can read or modify `C:\ProgramData\Chainlink`. Chainlink creates that folder with its final owner and permissions in one step, and refuses to reuse a folder that another account created or owns, because everything in it runs as SYSTEM.
+- **Recovery words** are 6 words picked at random from a built-in list of 256. The PC stores only a salted, slow hash of them (PBKDF2, 300,000 rounds), never the words themselves. Records made by the original release (100,000 rounds) remain usable until you choose **New recovery words**.
+- Without a valid key, errors fail closed: an invalid key file, unreadable state, or a failed watchdog cycle leaves the blocks on, and a missing or damaged installed blocklist blocks every site until the key is plugged in again. Errors are recorded in `C:\ProgramData\Chainlink\log.txt`.
+- Install, repair, and uninstall hold a lock that the watchdog also needs, so the watchdog can never re-apply blocks half way through an uninstall. Uninstall removes the scheduled task first, then lifts the blocks, then deletes the files.
 
 ## Update or repair an installation
 
@@ -103,7 +105,8 @@ Run `Chainlink.cmd` from the paired USB and click **Repair / update this PC**. T
 
 - `C:\ProgramData\Chainlink\status.txt` shows the watchdog's last lock state.
 - `C:\ProgramData\Chainlink\log.txt` records state changes and errors and rotates at about 200 KB.
-- If linking reports that browser policies could not be saved, Chainlink stops the install rather than risk overwriting policies it cannot restore.
+- If linking reports that browser policies could not be saved, Chainlink stops the install rather than risk overwriting policies it cannot restore. A first-time link that fails removes what it created, so you can simply try again.
+- If the saved policy snapshot is ever lost or damaged, unlock and uninstall still work: Chainlink removes the values it manages and leaves everything else alone.
 - Firefox applies policy changes only after Firefox restarts.
 
 ## Development
@@ -114,7 +117,7 @@ The production scripts support Windows PowerShell 5.1 (the version included with
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\PowerShell.Tests.ps1
 ```
 
-The tests parse every PowerShell file and exercise URL/channel normalization, rejection cases, hashing, constant-time comparison, atomic writes, and blocklist limits/deduplication. See [SECURITY.md](SECURITY.md) for the threat model and responsible-reporting guidance.
+The tests parse every PowerShell file and exercise URL/channel normalization, rejection cases, hashing, constant-time comparison, atomic writes, and blocklist limits/deduplication. They also run the lock, unlock, and tamper-detection code against a scratch registry key under `HKCU`, run the watchdog loop and the install, repair, and uninstall flows against temporary folders with Task Scheduler replaced by stubs, and (in an elevated prompt) check the program-folder permissions. They never touch real browser policy, the real Chainlink folder, or real scheduled tasks. See [SECURITY.md](SECURITY.md) for the threat model and responsible-reporting guidance.
 
 ## License
 

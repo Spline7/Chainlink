@@ -1,4 +1,8 @@
 # Chainlink watchdog. Runs as SYSTEM from the Chainlink scheduled task.
+# Every 5 seconds it looks for the paired Chainlink USB key:
+#   - key NOT found -> browser blocks are ON
+#   - key found     -> browser blocks are OFF, and the blocklist is synced from the USB
+# This script makes no network requests and sends no telemetry.
 [CmdletBinding(DefaultParameterSetName = 'Watch')]
 param(
     [Parameter(ParameterSetName = 'Unlock')][switch]$Unlock,
@@ -13,22 +17,24 @@ if ([string]::IsNullOrWhiteSpace($ProgramData)) { throw 'Windows did not provide
 $AppDir        = Join-Path $ProgramData 'Chainlink'
 $PairFile      = Join-Path $AppDir 'pair.txt'
 $BlocklistFile = Join-Path $AppDir 'blocklist.txt'
+$AppliedFile   = Join-Path $AppDir 'applied-blocklist.txt'
 $BaselineFile  = Join-Path $AppDir 'policy-baseline.json'
+$LockFile      = Join-Path $AppDir 'watchdog.lock'
 $LogFile       = Join-Path $AppDir 'log.txt'
 $StatusFile    = Join-Path $AppDir 'status.txt'
 $KeyRelPath    = 'Chainlink\chainlink.key'
+$PolicyRoot    = 'HKLM:\SOFTWARE\Policies'
+$MaxUsbBlocklistBytes = 1MB
 $CommonModule  = Join-Path $PSScriptRoot 'Chainlink.Common.psm1'
 Import-Module $CommonModule -Force
 
-$Chromium = @(
-    @{ Name = 'Chrome'; Key = 'HKLM:\SOFTWARE\Policies\Google\Chrome';       Private = 'IncognitoModeAvailability'; AddProfile = 'BrowserAddPersonEnabled' },
-    @{ Name = 'Edge';   Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge';      Private = 'InPrivateModeAvailability'; AddProfile = 'BrowserAddProfileEnabled' },
-    @{ Name = 'Brave';  Key = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; Private = 'IncognitoModeAvailability'; AddProfile = 'BrowserAddPersonEnabled' }
-)
-$FirefoxKey = 'HKLM:\SOFTWARE\Policies\Mozilla\Firefox'
+$script:LastLogMessage = ''
 
 function Write-Log {
-    param([Parameter(Mandatory = $true)][string]$Message)
+    param([Parameter(Mandatory = $true)][string]$Message, [switch]$Once)
+    # -Once: a fault that repeats every cycle is logged once, not every five seconds.
+    if ($Once -and $Message -eq $script:LastLogMessage) { return }
+    $script:LastLogMessage = $Message
     try {
         if ((Test-Path -LiteralPath $LogFile) -and (Get-Item -LiteralPath $LogFile).Length -gt 200KB) {
             Move-Item -LiteralPath $LogFile -Destination "$LogFile.old" -Force
@@ -42,57 +48,9 @@ function Set-Status {
     try { Set-ChainlinkTextFileAtomic -Path $StatusFile -Lines @($Status) } catch { }
 }
 
-function Ensure-Key {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
-}
-
-function Set-Dword {
-    param([string]$Path, [string]$Name, [int]$Value)
-    Ensure-Key $Path
-    New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
-}
-
-function Get-ValueSnapshot {
-    param([string]$Path, [string]$Name)
-    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ Present = $false; Value = $null; Kind = $null } }
-    $key = Get-Item -LiteralPath $Path
-    if ($key.GetValueNames() -notcontains $Name) { return [pscustomobject]@{ Present = $false; Value = $null; Kind = $null } }
-    return [pscustomobject]@{ Present = $true; Value = $key.GetValue($Name, $null, 'DoNotExpandEnvironmentNames'); Kind = $key.GetValueKind($Name).ToString() }
-}
-
-function Get-ListSnapshot {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    $key = Get-Item -LiteralPath $Path
-    $values = @()
-    foreach ($name in $key.GetValueNames()) {
-        $values += [pscustomobject]@{ Name = $name; Value = [string]$key.GetValue($name, $null, 'DoNotExpandEnvironmentNames'); Kind = $key.GetValueKind($name).ToString() }
-    }
-    return $values
-}
-
 function Save-Baseline {
     if (Test-Path -LiteralPath $BaselineFile) { return }
-    $items = @{}
-    foreach ($browser in $Chromium) {
-        $properties = @{}
-        foreach ($name in @($browser.Private, 'BrowserGuestModeEnabled', $browser.AddProfile, 'TorDisabled')) {
-            $properties[$name] = Get-ValueSnapshot $browser.Key $name
-        }
-        $items[$browser.Name] = [pscustomobject]@{
-            Properties = $properties
-            Blocklist = @(Get-ListSnapshot (Join-Path $browser.Key 'URLBlocklist'))
-        }
-    }
-    $baseline = [pscustomobject]@{
-        Version = 1
-        Chromium = $items
-        Firefox = [pscustomobject]@{
-            Properties = @{ DisablePrivateBrowsing = (Get-ValueSnapshot $FirefoxKey 'DisablePrivateBrowsing') }
-            Blocklist = @(Get-ListSnapshot (Join-Path $FirefoxKey 'WebsiteFilter\Block'))
-        }
-    }
+    $baseline = Get-ChainlinkPolicyBaseline -Root $PolicyRoot
     Set-ChainlinkTextFileAtomic -Path $BaselineFile -Lines @(($baseline | ConvertTo-Json -Depth 8))
     Write-Log 'Captured pre-install browser policy baseline.'
 }
@@ -101,141 +59,51 @@ function Read-Baseline {
     if (-not (Test-Path -LiteralPath $BaselineFile -PathType Leaf)) { return $null }
     try {
         $baseline = Get-Content -LiteralPath $BaselineFile -Raw | ConvertFrom-Json
-        if ($baseline.Version -ne 1) { throw 'Unsupported baseline version.' }
+        if (-not (Test-ChainlinkPolicyBaseline $baseline)) { throw 'unsupported or incomplete baseline' }
         return $baseline
     } catch {
-        Write-Log "Policy baseline is invalid; existing policies will be preserved: $($_.Exception.Message)"
+        Write-Log "Policy baseline is unreadable; Chainlink will remove only its own values: $($_.Exception.Message)" -Once
         return $null
     }
 }
 
+# The installed blocklist, or "*" (block everything) when it is missing or corrupt.
 function Get-Blocklist {
     try {
         if (-not (Test-Path -LiteralPath $BlocklistFile -PathType Leaf)) { throw 'Installed blocklist is missing.' }
         return @(Get-ChainlinkBlocklist -Path $BlocklistFile)
     } catch {
-        Write-Log "Installed blocklist is invalid; blocking all URLs as a fail-safe: $($_.Exception.Message)"
+        Write-Log "Installed blocklist is invalid; blocking all URLs as a fail-safe: $($_.Exception.Message)" -Once
         return @('*')
     }
 }
 
-function Get-FirefoxPatterns {
-    param([Parameter(Mandatory = $true)][string]$Entry)
-    $slash = $Entry.IndexOf('/')
-    if ($slash -lt 0) { return @("*://$Entry/*", "*://*.$Entry/*") }
-    $hostPart = $Entry.Substring(0, $slash)
-    $pathPart = $Entry.Substring($slash)
-    return @("*://$hostPart$pathPart", "*://$hostPart$pathPart/*", "*://$hostPart$pathPart?*", "*://*.$hostPart$pathPart", "*://*.$hostPart$pathPart/*", "*://*.${hostPart}${pathPart}?*")
-}
-
-function Get-UniqueStrings {
-    param([AllowEmptyCollection()][object[]]$Values)
-    $result = New-Object 'System.Collections.Generic.List[string]'
-    $seen = @{}
-    foreach ($value in $Values) {
-        $text = [string]$value
-        if ($text -ne '' -and -not $seen.ContainsKey($text)) { $seen[$text] = $true; $result.Add($text) }
+# The entries the last lock wrote. Unlock removes exactly these, even if blocklist.txt has
+# changed or been damaged since.
+function Read-AppliedEntries {
+    if (-not (Test-Path -LiteralPath $AppliedFile -PathType Leaf)) { return }
+    foreach ($line in [IO.File]::ReadAllLines($AppliedFile)) {
+        if ($line -ne '' -and $line.Length -le 4096) { $line }
     }
-    return $result.ToArray()
-}
-
-function Set-ListValues {
-    param([string]$Path, [AllowEmptyCollection()][string[]]$Values)
-    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
-    if ($Values.Count -eq 0) { return }
-    New-Item -Path $Path -Force | Out-Null
-    for ($i = 0; $i -lt $Values.Count; $i++) {
-        New-ItemProperty -LiteralPath $Path -Name ([string]($i + 1)) -Value $Values[$i] -PropertyType String -Force | Out-Null
-    }
-}
-
-function Get-BaselineListValues {
-    param($Snapshot)
-    if ($null -eq $Snapshot) { return }
-    return @($Snapshot | ForEach-Object { [string]$_.Value })
-}
-
-function Restore-Property {
-    param([string]$Path, [string]$Name, $Snapshot, [int]$ManagedValue)
-    if ($null -eq $Snapshot) { return }
-    $current = Get-ValueSnapshot $Path $Name
-    if ($current.Present -and [int]$current.Value -ne $ManagedValue) { return }
-    if ($Snapshot.Present) {
-        Ensure-Key $Path
-        New-ItemProperty -LiteralPath $Path -Name $Name -Value $Snapshot.Value -PropertyType $Snapshot.Kind -Force | Out-Null
-    } elseif ($current.Present) {
-        Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
-    }
-}
-
-function Get-UnmanagedCurrentValues {
-    param([string]$Path, [AllowEmptyCollection()][string[]]$ManagedValues)
-    $managed = @{}
-    foreach ($value in $ManagedValues) { $managed[$value] = $true }
-    return @(Get-ListSnapshot $Path | ForEach-Object { [string]$_.Value } | Where-Object { -not $managed.ContainsKey($_) })
 }
 
 function Set-Lock {
     $list = @(Get-Blocklist)
-    $baseline = Read-Baseline
-    foreach ($browser in $Chromium) {
-        $urlKey = Join-Path $browser.Key 'URLBlocklist'
-        $baseBrowser = if ($null -ne $baseline) { $baseline.Chromium.($browser.Name) } else { $null }
-        $existing = @(Get-UnmanagedCurrentValues $urlKey $list)
-        $baseValues = if ($null -ne $baseBrowser) { @(Get-BaselineListValues $baseBrowser.Blocklist) } else { @() }
-        Set-ListValues $urlKey @(Get-UniqueStrings @($baseValues + $existing + $list))
-        Set-Dword $browser.Key $browser.Private 1
-        Set-Dword $browser.Key 'BrowserGuestModeEnabled' 0
-        Set-Dword $browser.Key $browser.AddProfile 0
-        if ($browser.Name -eq 'Brave') { Set-Dword $browser.Key 'TorDisabled' 1 }
-    }
-
-    $patterns = @($list | ForEach-Object { Get-FirefoxPatterns $_ })
-    $firefoxBlock = Join-Path $FirefoxKey 'WebsiteFilter\Block'
-    $baseFirefox = if ($null -ne $baseline) { $baseline.Firefox } else { $null }
-    $existingFirefox = @(Get-UnmanagedCurrentValues $firefoxBlock $patterns)
-    $baseFirefoxValues = if ($null -ne $baseFirefox) { @(Get-BaselineListValues $baseFirefox.Blocklist) } else { @() }
-    Set-ListValues $firefoxBlock @(Get-UniqueStrings @($baseFirefoxValues + $existingFirefox + $patterns))
-    Set-Dword $FirefoxKey 'DisablePrivateBrowsing' 1
+    $previous = @(Read-AppliedEntries)
+    # Record the entries before writing them, so an interrupted lock can still be undone.
+    Set-ChainlinkTextFileAtomic -Path $AppliedFile -Lines @(Merge-ChainlinkValues $previous $list)
+    Set-ChainlinkPolicyLock -Root $PolicyRoot -Entries $list -PreviousEntries $previous -Baseline (Read-Baseline)
+    Set-ChainlinkTextFileAtomic -Path $AppliedFile -Lines $list
 }
 
 function Remove-Lock {
-    $list = @(Get-Blocklist)
-    $baseline = Read-Baseline
-    foreach ($browser in $Chromium) {
-        $urlKey = Join-Path $browser.Key 'URLBlocklist'
-        $remaining = @(Get-UnmanagedCurrentValues $urlKey $list)
-        $baseBrowser = if ($null -ne $baseline) { $baseline.Chromium.($browser.Name) } else { $null }
-        if ($null -ne $baseBrowser) { $remaining = @(Get-UniqueStrings @((Get-BaselineListValues $baseBrowser.Blocklist) + $remaining)) }
-        Set-ListValues $urlKey $remaining
-        if ($null -ne $baseBrowser) {
-            Restore-Property $browser.Key $browser.Private $baseBrowser.Properties.($browser.Private) 1
-            Restore-Property $browser.Key 'BrowserGuestModeEnabled' $baseBrowser.Properties.BrowserGuestModeEnabled 0
-            Restore-Property $browser.Key $browser.AddProfile $baseBrowser.Properties.($browser.AddProfile) 0
-            if ($browser.Name -eq 'Brave') { Restore-Property $browser.Key 'TorDisabled' $baseBrowser.Properties.TorDisabled 1 }
-        }
-    }
-
-    $patterns = @($list | ForEach-Object { Get-FirefoxPatterns $_ })
-    $firefoxBlock = Join-Path $FirefoxKey 'WebsiteFilter\Block'
-    $remainingFirefox = @(Get-UnmanagedCurrentValues $firefoxBlock $patterns)
-    if ($null -ne $baseline) { $remainingFirefox = @(Get-UniqueStrings @((Get-BaselineListValues $baseline.Firefox.Blocklist) + $remainingFirefox)) }
-    Set-ListValues $firefoxBlock $remainingFirefox
-    if ($null -ne $baseline) { Restore-Property $FirefoxKey 'DisablePrivateBrowsing' $baseline.Firefox.Properties.DisablePrivateBrowsing 1 }
+    $managed = @(Merge-ChainlinkValues @(Read-AppliedEntries) @(Get-Blocklist))
+    Remove-ChainlinkPolicyLock -Root $PolicyRoot -Entries $managed -Baseline (Read-Baseline)
+    if (Test-Path -LiteralPath $AppliedFile) { Remove-Item -LiteralPath $AppliedFile -Force }
 }
 
 function Test-LockIntact {
-    $list = @(Get-Blocklist)
-    foreach ($browser in $Chromium) {
-        try {
-            $policy = Get-ItemProperty -LiteralPath $browser.Key -ErrorAction Stop
-            if ($policy.($browser.Private) -ne 1 -or $policy.BrowserGuestModeEnabled -ne 0 -or $policy.($browser.AddProfile) -ne 0) { return $false }
-            if ($browser.Name -eq 'Brave' -and $policy.TorDisabled -ne 1) { return $false }
-            $actual = @(Get-ListSnapshot (Join-Path $browser.Key 'URLBlocklist') | ForEach-Object { [string]$_.Value })
-            foreach ($entry in $list) { if ($actual -notcontains $entry) { return $false } }
-        } catch { return $false }
-    }
-    return $true
+    return (Test-ChainlinkPolicyLock -Root $PolicyRoot -Entries @(Get-Blocklist))
 }
 
 function Get-VolumeSerial {
@@ -248,12 +116,14 @@ function Get-VolumeSerial {
 
 function Read-KeyToken {
     param([Parameter(Mandatory = $true)][string]$Path)
+    if ((Get-Item -LiteralPath $Path -Force).Length -gt 1024) { return $null }
     $token = (Get-Content -LiteralPath $Path -Raw -ErrorAction Stop).Trim()
     try { $bytes = [Convert]::FromBase64String($token) } catch { return $null }
     if ($bytes.Length -ne 32) { return $null }
     return $token
 }
 
+# Returns the root of the drive holding a valid paired key (e.g. "D:\"), or $null.
 function Find-Key {
     if (-not (Test-Path -LiteralPath $PairFile -PathType Leaf)) { return $null }
     $expected = @(Get-Content -LiteralPath $PairFile | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -match '^[a-f0-9]{64}$' })
@@ -269,72 +139,98 @@ function Find-Key {
             $serial = Get-VolumeSerial $root
             if ($null -eq $token -or [string]::IsNullOrWhiteSpace($serial)) { continue }
             if ($expected -contains (Get-ChainlinkSha256Hex "$token|$serial")) { return $root }
-        } catch { Write-Log "Could not inspect drive $($drive.Name): $($_.Exception.Message)" }
+        } catch { Write-Log "Could not inspect drive $($drive.Name): $($_.Exception.Message)" -Once }
     }
     return $null
 }
 
-function Test-UsbBlocklist {
-    param([Parameter(Mandatory = $true)][string]$UsbRoot)
-    $source = Join-Path $UsbRoot 'Chainlink\blocklist.txt'
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'The paired USB is missing blocklist.txt.' }
-    [void](Get-ChainlinkBlocklist -Path $source)
-    return $source
-}
-
+# Copies the blocklist from the USB when it has changed and is valid. Returns '' on success, or
+# a short description of what is wrong with the USB copy. A bad USB blocklist never prevents
+# the key from unlocking this PC; the previously installed list simply stays in force.
 function Sync-Blocklist {
     param([Parameter(Mandatory = $true)][string]$UsbRoot)
-    $source = Test-UsbBlocklist $UsbRoot
-    $same = (Test-Path -LiteralPath $BlocklistFile -PathType Leaf) -and ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath $BlocklistFile).Hash)
-    if (-not $same) {
-        $temporary = Join-Path $AppDir ('.blocklist-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
-        try {
-            Copy-Item -LiteralPath $source -Destination $temporary -Force
-            Move-Item -LiteralPath $temporary -Destination $BlocklistFile -Force
-        } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
-        Write-Log 'Blocklist updated from USB.'
+    $source = Join-Path $UsbRoot 'Chainlink\blocklist.txt'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { return 'the USB has no Chainlink\blocklist.txt' }
+    if ((Get-Item -LiteralPath $source -Force).Length -gt $MaxUsbBlocklistBytes) { return 'blocklist.txt on the USB is too large' }
+
+    $installed = Test-Path -LiteralPath $BlocklistFile -PathType Leaf
+    if ($installed -and ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath $BlocklistFile).Hash)) { return '' }
+
+    # Validate the same bytes that get installed: copy first, check the copy, then swap it in.
+    $temporary = Join-Path $AppDir ('.blocklist-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+    try {
+        Copy-Item -LiteralPath $source -Destination $temporary -Force
+        try { [void]@(Get-ChainlinkBlocklist -Path $temporary) }
+        catch { return "blocklist.txt on the USB has a problem: $($_.Exception.Message)" }
+        Move-Item -LiteralPath $temporary -Destination $BlocklistFile -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
     }
+    Write-Log 'Blocklist updated from USB.'
+    return ''
 }
+
+$script:State = ''        # '', 'locked', or 'unlocked'
+$script:UsbProblem = ''
+$script:Tick = 0
+
+# One pass of the watchdog loop.
+function Invoke-WatchdogCycle {
+    $usb = $null
+    try {
+        $usb = Find-Key
+        if ($usb) {
+            if ($script:State -ne 'unlocked') {
+                Remove-Lock
+                $script:State = 'unlocked'
+                $script:UsbProblem = ''
+                Set-Status "UNLOCKED - key found on $usb"
+                Write-Log "Key found on $usb - blocks lifted."
+            }
+            $problem = Sync-Blocklist $usb
+            if ($problem -ne $script:UsbProblem) {
+                $script:UsbProblem = $problem
+                if ($problem) {
+                    Set-Status "UNLOCKED - key found on $usb. The previous blocklist is still in use: $problem"
+                    Write-Log "Blocklist not updated: $problem"
+                } else { Set-Status "UNLOCKED - key found on $usb" }
+            }
+        } elseif ($script:State -ne 'locked' -or (($script:Tick % 12) -eq 0 -and -not (Test-LockIntact))) {
+            Set-Lock
+            if ($script:State -eq 'locked') { Write-Log 'Blocks were changed outside Chainlink - re-applied.' }
+            else { Write-Log 'Key not present - blocks applied.' }
+            $script:State = 'locked'
+            Set-Status 'LOCKED - key not present'
+        }
+    } catch {
+        Write-Log "Watchdog cycle failed: $($_.Exception.Message)" -Once
+        # With the key present there is nothing to enforce; the unlock is retried next cycle.
+        # Without it, make sure the blocks are on.
+        $script:State = ''
+        if (-not $usb) {
+            try { Set-Lock; $script:State = 'locked'; Set-Status 'LOCKED - fail-safe after an error' }
+            catch { Write-Log "Fail-safe lock also failed: $($_.Exception.Message)" -Once }
+        }
+    }
+    $script:Tick++
+}
+
+# Dot-sourcing this file (as the tests do) defines the functions above without running anything.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 if ($CaptureBaseline) { Save-Baseline; exit 0 }
 if ($Unlock) { Remove-Lock; Write-Log 'Chainlink browser policies removed and prior policies restored.'; exit 0 }
 
-$created = $false
-$mutex = New-Object Threading.Mutex($true, 'Global\ChainlinkWatchdog', [ref]$created)
-if (-not $created) { Write-Log 'A watchdog instance is already running; exiting duplicate.'; $mutex.Dispose(); exit 0 }
+if (-not (Test-Path -LiteralPath $AppDir -PathType Container)) { exit 0 }   # uninstalled
+$lock = Open-ChainlinkWatchdogLock -Path $LockFile
+if ($null -eq $lock) { exit 0 }   # another watchdog, or an install or uninstall, holds the lock
 
 try {
     Write-Log 'Watchdog started.'
-    $state = ''
-    $tick = 0
     while ($true) {
-        try {
-            $usb = Find-Key
-            if ($usb) {
-                [void](Test-UsbBlocklist $usb)
-                if ($state -ne 'unlocked') {
-                    Remove-Lock
-                    $state = 'unlocked'
-                    Set-Status "UNLOCKED - key found on $usb"
-                    Write-Log "Key found on $usb - blocks lifted."
-                }
-                Sync-Blocklist $usb
-            } elseif ($state -ne 'locked' -or (($tick % 12) -eq 0 -and -not (Test-LockIntact))) {
-                Set-Lock
-                if ($state -eq 'locked') { Write-Log 'Blocks were changed outside Chainlink - re-applied.' }
-                else { Write-Log 'Key not present - blocks applied.' }
-                $state = 'locked'
-                Set-Status 'LOCKED - key not present'
-            }
-        } catch {
-            Write-Log "Watchdog cycle failed: $($_.Exception.Message)"
-            try { Set-Lock; $state = 'locked'; Set-Status 'LOCKED - fail-safe after an error' }
-            catch { Write-Log "Fail-safe lock also failed: $($_.Exception.Message)" }
-        }
-        $tick++
+        Invoke-WatchdogCycle
         Start-Sleep -Seconds 5
     }
 } finally {
-    try { $mutex.ReleaseMutex() } catch { }
-    $mutex.Dispose()
+    $lock.Dispose()
 }

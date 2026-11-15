@@ -9,7 +9,7 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parents[1] / "Chainlink"
 sys.path.insert(0, str(SOURCE))
 
-from windows_support import task_xml, volume_serial  # noqa: E402
+from windows_support import secure_app_directory, task_xml, volume_serial  # noqa: E402
 
 
 def main() -> int:
@@ -19,10 +19,16 @@ def main() -> int:
     serial.add_argument("root")
     xml = subparsers.add_parser("disabled-task-xml")
     xml.add_argument("output", type=Path)
+    secure = subparsers.add_parser("secure-directory")
+    secure.add_argument("path", type=Path)
     arguments = parser.parse_args()
 
     if arguments.command == "serial":
         print(volume_serial(arguments.root))
+        return 0
+    if arguments.command == "secure-directory":
+        arguments.path.mkdir(exist_ok=False)
+        secure_app_directory(arguments.path)
         return 0
     generated = task_xml(Path(sys.executable), Path(r"C:\ProgramData\Chainlink\watchdog.py"))
     generated = generated.replace("<Settings>", "<Settings><Enabled>false</Enabled>")

@@ -9,12 +9,20 @@ fn run() -> anyhow::Result<()> {
     use std::env;
     use std::path::Path;
 
-    let system = Env::system()?;
     let mode = env::args().nth(1).unwrap_or_default();
     if mode == "--watchdog" {
-        // Started by the scheduled task as SYSTEM.
-        return windows::run_watchdog(&system);
+        // Started by the scheduled task as SYSTEM, where nobody can see or dismiss a message
+        // box. An error ends the process so that Task Scheduler starts it again.
+        let outcome = Env::system().and_then(|system| {
+            let outcome = windows::run_watchdog(&system);
+            if let Err(error) = &outcome {
+                system.log(&format!("Watchdog stopped: {error:#}"));
+            }
+            outcome
+        });
+        std::process::exit(i32::from(outcome.is_err()));
     }
+    let system = Env::system()?;
 
     let executable = env::current_exe()?;
     let is_stub = executable
@@ -37,7 +45,7 @@ fn run() -> anyhow::Result<()> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow::anyhow!("executable has no parent"))?;
-    if usb_dir == system.app_dir {
+    if windows::same_path(&usb_dir, &system.app_dir) {
         anyhow::bail!(
             "This copy of Chainlink is the installed background program. Open Chainlink from the USB drive instead."
         );

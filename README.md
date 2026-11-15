@@ -55,7 +55,7 @@ Click **Save blocklist**, then leave the USB plugged in for about 10 seconds so 
 
 Entries must be ordinary HTTP or HTTPS hostnames, with an optional port and path. `*.example.com` and `example.com/*` are accepted and mean the same as `example.com`. Chainlink rejects credentials, query strings, fragments, malformed URLs, overly long entries, and blocklists above 2,048 entries instead of passing ambiguous input to browser policy.
 
-If `blocklist.txt` on the USB has a line Chainlink cannot use (for example after a typo in Notepad), your key still unlocks the PC. The PC keeps its last good list until the file is fixed, and the Chainlink window shows the bad lines so you can correct them. Firefox reads at most 1,000 patterns, and each entry takes two to six, so very long lists are only fully enforced in Chrome, Edge, and Brave.
+If `blocklist.txt` on the USB has a line Chainlink cannot use (for example after a typo in Notepad), your key still unlocks the PC. The PC keeps its last good list until the file is fixed, and the Chainlink window shows the bad lines so you can correct them. Browsers read only the first 1,000 entries of a policy list. Chrome, Edge, and Brave use one per blocklist entry and Firefox uses two to six, so keep the list well under those limits. An entry with a port (`example.com:8080`) is enforced by Chrome, Edge, and Brave; Firefox's filter has no port matching and may ignore it.
 
 The list is stored in `Chainlink\blocklist.txt` on the USB, so you can also edit it in Notepad.
 
@@ -64,7 +64,7 @@ The list is stored in `Chainlink\blocklist.txt` on the USB, so you can also edit
 ## Uninstall
 
 1. Plug in the USB and double-click **Chainlink.cmd**.
-2. Click **Uninstall from this PC**, then **Yes**.
+2. Click **Uninstall**, then **Yes**.
 
 This removes the background task, every browser block, and the program folder (`C:\ProgramData\Chainlink`). Your USB keeps working for any other PCs it's linked to.
 
@@ -92,10 +92,10 @@ If your partner loses the words, plug in your USB, open Chainlink, and click **N
   - **Not found:** it writes the blocklist into the browsers' policy settings in the registry (`URLBlocklist` for Chrome/Edge/Brave, `WebsiteFilter` for Firefox). It also turns off Incognito/InPrivate, guest mode, and adding profiles. About once a minute it checks whether those settings were changed and puts them back.
   - **Found:** it removes those settings and copies `blocklist.txt` from the USB if the file changed.
 - Only SYSTEM and Administrators can read or modify `C:\ProgramData\Chainlink`. Chainlink creates that folder with its final owner and permissions in one step, and refuses to reuse a folder that another account created or owns, because the program in it runs as SYSTEM.
-- The Start menu entry for emergency uninstall is a copy of the same program. It asks for administrator rights itself and removes itself once the uninstall is done.
+- The Start menu shortcut for emergency uninstall opens a copy of the same program kept in `C:\Program Files\Chainlink`, where everyone can read it and only administrators can change it. That copy asks for administrator rights itself and removes itself once the uninstall is done.
 - **Recovery words** are 6 words picked at random from a built-in list of 256. New records use salted PBKDF2-HMAC-SHA256 with 300,000 rounds. Existing PowerShell recovery records remain usable until you choose **New recovery words**.
-- Without a valid key, errors fail closed: an invalid key file, unreadable state, or a failed watchdog cycle leaves the blocks on, and a missing or damaged installed blocklist blocks every site until the key is plugged in again. Errors are recorded in `C:\ProgramData\Chainlink\log.txt`.
-- Install, repair, and uninstall hold a lock that the watchdog also needs, so the watchdog can never re-apply blocks half way through an uninstall. Uninstall removes the scheduled task first, then lifts the blocks, then deletes the files.
+- Without a valid key, errors fail closed: after an invalid key file, unreadable state, or a failed watchdog cycle the watchdog keeps trying to apply the blocks, and a missing or damaged installed blocklist blocks every site until the key is plugged in again. Errors are recorded in `C:\ProgramData\Chainlink\log.txt`.
+- Install, repair, and uninstall hold a lock that the watchdog also needs. Uninstall removes the scheduled task first, lifts the blocks, and leaves a marker that makes any watchdog that was already starting exit instead of locking again, then deletes the files.
 
 ## Update or repair an installation
 

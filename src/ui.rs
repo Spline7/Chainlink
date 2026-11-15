@@ -1,5 +1,7 @@
 use anyhow::Result;
-use chainlink_blocker::core::{SHORTS_ENTRY, atomic_write, normalize_channel, normalize_entry};
+use chainlink_blocker::core::{
+    MAX_BLOCKLIST_ENTRIES, SHORTS_ENTRY, atomic_write, normalize_channel, normalize_entry,
+};
 use chainlink_blocker::windows::{Env, Scheduler};
 use native_windows_gui as nwg;
 use std::cell::RefCell;
@@ -274,6 +276,13 @@ impl SettingsApp {
             lines.push(SHORTS_ENTRY.to_owned());
         }
         lines.extend(channels);
+        let entries = lines
+            .iter()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .count();
+        if entries > MAX_BLOCKLIST_ENTRIES {
+            anyhow::bail!("the blocklist can hold at most {MAX_BLOCKLIST_ENTRIES} entries");
+        }
         atomic_write(
             &self.source_blocklist(),
             format!("{}\n", lines.join("\n")).as_bytes(),
@@ -551,6 +560,8 @@ impl EmergencyApp {
         match self.env.uninstall(&Scheduler, STOP_TIMEOUT) {
             Ok(()) => {
                 nwg::modal_info_message(&self.window, "Chainlink", "Chainlink has been removed.");
+                // The last thing this copy does: arrange for its own removal once it has exited.
+                self.env.remove_stub_after_exit();
                 nwg::stop_thread_dispatch();
             }
             Err(error) => show_error(&self.window, "Uninstall failed", &error),

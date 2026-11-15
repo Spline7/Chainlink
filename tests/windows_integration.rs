@@ -234,11 +234,16 @@ impl World {
         let scratch = Scratch::new();
         let usb = directory.path().join("usb");
         fs::create_dir_all(usb.join("Chainlink")).unwrap();
-        let env = Env::new(
+        let mut env = Env::new(
             directory.path().join("app"),
             scratch.root(),
-            directory.path().join(windows::EMERGENCY_STUB_NAME),
+            directory
+                .path()
+                .join("stub")
+                .join(windows::EMERGENCY_STUB_NAME),
+            directory.path().join("Chainlink Emergency Uninstall.lnk"),
         );
+        env.require_usb_layout = false; // the tests cannot write to a drive root
         Self {
             _directory: directory,
             scratch,
@@ -421,8 +426,47 @@ fn volume_serial_matches_windows_inventory() {
     assert!(serials.contains(&reported), "{reported} not in {serials:?}");
 }
 
+fn icacls(path: &Path, grant: &str) {
+    let status = Command::new("icacls.exe")
+        .arg(path)
+        .args(["/grant", grant])
+        .output()
+        .expect("run icacls");
+    assert!(status.status.success());
+}
+
 #[test]
-fn protected_directory_is_created_closed_and_never_adopted() {
+fn only_folders_non_administrators_could_not_write_are_trusted() {
+    if !windows::is_admin() {
+        eprintln!("skipped: needs an elevated prompt to assign the Administrators group as owner");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let plain = directory.path().join("plain");
+    fs::create_dir(&plain).unwrap();
+    assert!(
+        !windows::is_trusted_directory(&plain).unwrap(),
+        "an ordinary folder under the user's profile"
+    );
+
+    let path = directory.path().join("protected");
+    windows::create_protected_directory(&path).unwrap();
+    fs::write(path.join("state.txt"), "x").unwrap();
+    assert!(windows::is_trusted_directory(&path).unwrap());
+    icacls(&path, "*S-1-5-32-545:(OI)(CI)RX");
+    assert!(
+        windows::is_trusted_directory(&path).unwrap(),
+        "read access for Users, as in the original release"
+    );
+    icacls(&path, "*S-1-5-32-545:(OI)(CI)M");
+    assert!(
+        !windows::is_trusted_directory(&path).unwrap(),
+        "write access for Users"
+    );
+}
+
+#[test]
+fn protected_directory_is_created_closed_and_cannot_replace_an_existing_one() {
     if !windows::is_admin() {
         eprintln!("skipped: needs an elevated prompt to assign the Administrators group as owner");
         return;
@@ -488,6 +532,19 @@ impl Host for FakeHost {
         self.calls.borrow_mut().push("powershell unlock".to_owned());
         Ok(())
     }
+
+    fn stop_legacy_watchdogs(&self) {
+        self.calls.borrow_mut().push("stop legacy".to_owned());
+    }
+
+    fn terminate_watchdog(&self, _process_id: u32) {
+        self.calls.borrow_mut().push("terminate".to_owned());
+    }
+
+    fn create_shortcut(&self, shortcut: &Path, target: &Path) -> Result<()> {
+        fs::write(shortcut, target.display().to_string())?;
+        Ok(())
+    }
 }
 
 const SHORT: Duration = Duration::from_millis(400);
@@ -510,18 +567,50 @@ fn install_world() -> Option<(World, PathBuf, PathBuf)> {
 }
 
 #[test]
-fn prefilled_folder_is_never_adopted() {
+fn folder_chainlink_did_not_create_is_never_used() {
     let Some((world, usb_dir, source)) = install_world() else {
         return;
     };
     fs::create_dir(&world.env.app_dir).unwrap();
     fs::write(world.env.file("chainlink.exe"), "planted").unwrap();
+    fs::write(world.env.file("watchdog.ps1"), "planted").unwrap();
     let host = FakeHost::default();
-    assert!(world.env.install(&host, &usb_dir, &source, SHORT).is_err());
+    let error = world
+        .env
+        .install(&host, &usb_dir, &source, SHORT)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("another account"),
+        "{error:#}"
+    );
+    let error = world.env.uninstall(&host, SHORT).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("another account"),
+        "{error:#}"
+    );
+    assert!(
+        host.take_calls().is_empty(),
+        "nothing may be run from, or because of, an untrusted folder"
+    );
     assert_eq!(
         fs::read_to_string(world.env.file("chainlink.exe")).unwrap(),
         "planted"
     );
+}
+
+#[test]
+fn linking_from_outside_the_usb_chainlink_folder_is_refused() {
+    let Some((mut world, usb_dir, source)) = install_world() else {
+        return;
+    };
+    world.env.require_usb_layout = true;
+    let host = FakeHost::default();
+    let error = world
+        .env
+        .install(&host, &usb_dir, &source, SHORT)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("top level"), "{error:#}");
+    assert!(!world.env.app_dir.exists());
 }
 
 #[test]
@@ -533,9 +622,14 @@ fn failed_first_link_leaves_nothing_behind() {
         fail_create: true,
         ..Default::default()
     };
-    assert!(world.env.install(&host, &usb_dir, &source, SHORT).is_err());
+    let error = world
+        .env
+        .install(&host, &usb_dir, &source, SHORT)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("simulated"), "{error:#}");
     assert!(!world.env.app_dir.exists());
     assert!(!world.env.emergency_stub.exists());
+    assert!(!world.env.emergency_shortcut.exists());
 }
 
 #[test]
@@ -545,9 +639,20 @@ fn foreign_task_blocks_linking() {
     };
     let host = FakeHost::default();
     *host.task.borrow_mut() = Some(task("S-1-5-18", r"C:\Windows\System32\cmd.exe", "/c exit"));
-    assert!(world.env.install(&host, &usb_dir, &source, SHORT).is_err());
+    let error = world
+        .env
+        .install(&host, &usb_dir, &source, SHORT)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("does not belong"),
+        "{error:#}"
+    );
     assert!(!world.env.app_dir.exists());
     assert!(host.task.borrow().is_some());
+    assert!(
+        host.take_calls().is_empty(),
+        "a foreign task is neither stopped nor deleted"
+    );
 }
 
 #[test]
@@ -574,7 +679,9 @@ fn link_repair_and_uninstall() {
         assert!(env.file(name).is_file(), "{name}");
     }
     assert!(env.emergency_stub.is_file());
-    assert_eq!(host.take_calls(), ["stop", "create"]);
+    assert!(env.emergency_shortcut.is_file());
+    assert!(env.read_baseline().is_some());
+    assert_eq!(host.take_calls(), ["create"]);
     assert!(env.usb_matches_pc(&usb_dir));
     assert!(env.verify_recovery(&words));
     let mut wrong = words.clone();
@@ -609,6 +716,17 @@ fn link_repair_and_uninstall() {
         "repair lifts the blocks"
     );
 
+    // A damaged baseline is replaced during repair instead of blocking it for good.
+    fs::write(env.file("policy-baseline.json"), "{ not json").unwrap();
+    env.install(&host, &usb_dir, &source, SHORT).unwrap();
+    assert!(env.read_baseline().is_some());
+
+    // The task is gone but the protected folder remains (interrupted uninstall): repair works.
+    *host.task.borrow_mut() = None;
+    host.take_calls();
+    env.install(&host, &usb_dir, &source, SHORT).unwrap();
+    assert_eq!(host.take_calls(), ["create"]);
+
     // While a watchdog holds the lock, uninstall must not touch anything.
     env.set_lock().unwrap();
     let held = windows::open_watchdog_lock(&env.file("watchdog.lock")).unwrap();
@@ -624,6 +742,44 @@ fn link_repair_and_uninstall() {
     assert!(world.scratch.subkeys().is_empty());
     assert!(!env.app_dir.exists());
     assert!(!env.emergency_stub.exists());
+    assert!(!env.emergency_shortcut.exists());
+}
+
+#[test]
+fn leftover_watchdog_holding_the_lock_is_asked_to_stop() {
+    let Some((world, usb_dir, source)) = install_world() else {
+        return;
+    };
+    let env = &world.env;
+    let host = FakeHost::default();
+    env.install(&host, &usb_dir, &source, SHORT).unwrap();
+    // Another process holds the lock and wrote its id, as a running watchdog does.
+    let lock_path = env.file("watchdog.lock");
+    let script = format!(
+        "$f = [IO.File]::Open('{}', 'OpenOrCreate', 'ReadWrite', 'Read'); $b = [Text.Encoding]::ASCII.GetBytes([string]$PID); $f.SetLength(0); $f.Write($b, 0, $b.Length); $f.Flush(); 'held'; Start-Sleep -Seconds 60",
+        lock_path.display()
+    );
+    let mut holder = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("start lock holder");
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(holder.stdout.as_mut().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    assert_eq!(line.trim(), "held");
+    assert_eq!(windows::watchdog_lock_owner(&lock_path), holder.id());
+    host.take_calls();
+    let outcome = env.uninstall(&host, SHORT);
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(outcome.is_err(), "the fake host does not really end it");
+    let calls = host.take_calls();
+    assert!(calls.contains(&"terminate".to_owned()), "{calls:?}");
+    assert!(env.app_dir.exists(), "nothing is removed while it runs");
 }
 
 #[test]
@@ -635,6 +791,7 @@ fn upgrade_from_the_original_powershell_release() {
     windows::create_protected_directory(&env.app_dir).unwrap();
     let script = env.file("watchdog.ps1");
     fs::write(&script, "# original watchdog").unwrap();
+    icacls(&env.app_dir, "*S-1-5-32-545:(OI)(CI)RX"); // the original let Users read the folder
     let host = FakeHost::default();
     *host.task.borrow_mut() = Some(task(
         "S-1-5-18",
@@ -645,17 +802,32 @@ fn upgrade_from_the_original_powershell_release() {
         ),
     ));
     env.install(&host, &usb_dir, &source, SHORT).unwrap();
-    assert_eq!(host.take_calls(), ["stop", "powershell unlock", "create"]);
+    assert_eq!(
+        host.take_calls(),
+        [
+            "stop",
+            "stop legacy",
+            "powershell unlock",
+            "stop legacy",
+            "create"
+        ]
+    );
     assert!(!script.exists());
     assert!(env.genuine_task(&host));
+    assert!(
+        windows::is_protected_directory(&env.app_dir).unwrap(),
+        "the upgrade closes the folder to Users"
+    );
 }
 
 #[test]
-fn real_scheduler_reports_no_foreign_chainlink_task_as_genuine() {
-    // Read-only: asks Task Scheduler whether a task named Chainlink exists.
-    let env = Env::system().unwrap();
-    if let Some(xml) = Scheduler.query_task_xml() {
-        // Whatever is registered under that name, the check must not panic.
-        let _ = env.task_xml_is_genuine(&xml);
-    }
+fn real_shortcut_is_created() {
+    // The only test that uses the real host: it writes one .lnk into a temporary folder.
+    let directory = tempfile::tempdir().unwrap();
+    let shortcut = directory.path().join("Chainlink Emergency Uninstall.lnk");
+    let target = directory.path().join("it's a target.exe");
+    fs::write(&target, b"x").unwrap();
+    Scheduler.create_shortcut(&shortcut, &target).unwrap();
+    let bytes = fs::read(&shortcut).unwrap();
+    assert!(bytes.len() > 76 && bytes[0] == 0x4c, "a shell link file");
 }

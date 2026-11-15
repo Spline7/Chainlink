@@ -85,14 +85,15 @@ pub fn normalize_entry(input: &str) -> Result<String> {
         Host::Ipv4(address) => address.to_string(),
         Host::Ipv6(address) => format!("[{address}]"),
     };
-    if let Some(stripped) = host.strip_prefix("www.") {
+    if let Some(stripped) = host.strip_prefix("www.")
+        && stripped.contains('.')
+    {
         host = stripped.to_owned();
     }
+    // Default ports are dropped whichever scheme was typed, so a saved entry re-reads the same.
     let port = match url.port() {
-        Some(80) if url.scheme() == "http" => String::new(),
-        Some(443) if url.scheme() == "https" => String::new(),
+        None | Some(80 | 443) => String::new(),
         Some(port) => format!(":{port}"),
-        None => String::new(),
     };
     let path = url.path().trim_end_matches('/');
     Ok(format!("{host}{port}{path}"))
@@ -130,6 +131,13 @@ pub fn normalize_channel(input: &str) -> Result<String> {
     let handle = value.strip_prefix('@').unwrap_or(value);
     if valid_channel_component(handle, 100) {
         return Ok(format!("youtube.com/@{handle}"));
+    }
+    // The window shows saved channels without "youtube.com/", so that form must be accepted back.
+    if let Some((kind, name)) = value.split_once('/')
+        && matches!(kind, "channel" | "c" | "user")
+        && valid_channel_component(name, 128)
+    {
+        return Ok(format!("youtube.com/{kind}/{name}"));
     }
     let mut entry = normalize_entry(value)?;
     if let Some(rest) = entry.strip_prefix("m.youtube.com/") {
@@ -239,8 +247,10 @@ pub fn read_key_token(path: &Path) -> Result<String> {
     let text = if bytes.starts_with(&[0xff, 0xfe]) || bytes.iter().take(4).any(|byte| *byte == 0) {
         let start = usize::from(bytes.starts_with(&[0xff, 0xfe])) * 2;
         let units: Vec<u16> = bytes[start..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         String::from_utf16(&units)?
     } else {
@@ -391,6 +401,51 @@ mod tests {
             ("Example.com/Path/", "example.com/Path"),
         ] {
             assert_eq!(normalize_entry(input).unwrap(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn saved_entries_read_back_the_same() {
+        for value in [
+            "http://example.com:443/",
+            "https://example.com:80",
+            "www.com",
+            "Example.com:8080/Path/",
+        ] {
+            let once = normalize_entry(value).unwrap();
+            assert_eq!(normalize_entry(&once).unwrap(), once, "{value}");
+        }
+        assert_eq!(normalize_entry("www.com").unwrap(), "www.com");
+        for value in [
+            "https://www.youtube.com/channel/UC123/videos",
+            "youtube.com/c/Name",
+            "https://m.youtube.com/user/Name/about",
+            "@Handle",
+        ] {
+            let saved = normalize_channel(value).unwrap();
+            let shown = saved.trim_start_matches("youtube.com/"); // what the window shows
+            assert_eq!(normalize_channel(shown).unwrap(), saved, "{value}");
+        }
+    }
+
+    #[test]
+    fn matches_values_produced_by_windows_powershell() {
+        // The key bytes 0..31 with volume serial A1B2C3D4, hashed by the PowerShell release.
+        let token = STANDARD.encode((0_u8..32).collect::<Vec<_>>());
+        assert_eq!(
+            pairing_hash(&token, "A1B2C3D4"),
+            "e2ea145bb592f6dfa5512ebd1a983190cf9e0e2d1f0824312d75fa5671f1222b"
+        );
+        // Recovery records written by the original and the hardened PowerShell release.
+        let words = words();
+        let mut wrong = words.clone();
+        wrong[5] = "barn".to_owned();
+        for record in [
+            "AAECAwQFBgcICQoLDA0ODw==:ao/IqI3QyN3XcXb3AtTrpvXicWeAKQM6RTfMoGt4yIs=",
+            "v1:300000:AAECAwQFBgcICQoLDA0ODw==:QrS3i2lBkfHZHIsYQqf8Ykk4+tXmcK4FtXdmDTNTggM=",
+        ] {
+            assert!(verify_recovery_record(record, &words), "{record}");
+            assert!(!verify_recovery_record(record, &wrong), "{record}");
         }
     }
 

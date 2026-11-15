@@ -2,7 +2,7 @@
 name = "chainlink-blocker"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "USB-keyed accountability website blocker for Windows"
 

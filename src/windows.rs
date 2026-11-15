@@ -11,6 +11,7 @@ use crate::core::{
     verify_recovery_record,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -26,9 +27,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_SHARING_VIOLATION, LocalFree, S_OK, SYSTEMTIME,
-};
+use windows_sys::Win32::Foundation::{ERROR_SHARING_VIOLATION, LocalFree, S_OK, SYSTEMTIME};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
@@ -44,13 +43,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetWindowsDirectoryW};
-use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
-    WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_ProgramData, IsUserAnAdmin, SHGetKnownFolderPath, ShellExecuteW,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, IsUserAnAdmin, SHGetKnownFolderPath, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use winreg::enums::{KEY_READ, KEY_WOW64_64KEY, KEY_WRITE};
@@ -61,6 +57,7 @@ const TASK_NAME: &str = r"\Chainlink";
 const REPARSE_POINT: u32 = 0x400;
 const MAX_USB_BLOCKLIST_BYTES: u64 = 1024 * 1024;
 pub const EMERGENCY_STUB_NAME: &str = "Chainlink Emergency Uninstall.exe";
+const EMERGENCY_SHORTCUT_NAME: &str = "Chainlink Emergency Uninstall.lnk";
 
 // ---------------------------------------------------------------- small helpers
 
@@ -82,13 +79,12 @@ unsafe fn from_wide_pointer(pointer: *const u16) -> OsString {
     }
 }
 
-fn program_data_dir() -> Result<PathBuf> {
+fn known_folder(id: &windows_sys::core::GUID, what: &str) -> Result<PathBuf> {
     let mut raw = std::ptr::null_mut();
-    let status =
-        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut raw) };
+    let status = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
     if status != S_OK || raw.is_null() {
         unsafe { CoTaskMemFree(raw.cast()) };
-        bail!("Windows could not resolve the ProgramData known folder (HRESULT {status:#x})");
+        bail!("Windows could not resolve the {what} known folder (HRESULT {status:#x})");
     }
     let path = unsafe { from_wide_pointer(raw) };
     unsafe { CoTaskMemFree(raw.cast()) };
@@ -160,7 +156,7 @@ fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub fn same_path(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
@@ -278,6 +274,61 @@ pub fn is_protected_directory(path: &Path) -> Result<bool> {
         }))
 }
 
+/// True when an SDDL rights field grants nothing beyond reading and executing.
+fn rights_are_read_only(rights: &str) -> bool {
+    const READ_EXECUTE: u32 = 0x1200A9; // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+    if let Some(hex) = rights
+        .strip_prefix("0x")
+        .or_else(|| rights.strip_prefix("0X"))
+    {
+        return u32::from_str_radix(hex, 16).is_ok_and(|mask| mask & !READ_EXECUTE == 0);
+    }
+    !rights.is_empty()
+        && rights.len().is_multiple_of(2)
+        && rights
+            .as_bytes()
+            .chunks(2)
+            .all(|code| matches!(code, b"FR" | b"FX" | b"GR" | b"GX"))
+}
+
+fn children_are_trusted(directory: &Path) -> Result<bool> {
+    for entry in fs::read_dir(directory)? {
+        let child = entry?.path();
+        if fs::symlink_metadata(&child).is_err() {
+            continue; // a temporary file that has since been renamed
+        }
+        if is_reparse(&child)? || !has_trusted_owner(&child)? {
+            return Ok(false);
+        }
+        if child.is_dir() && !children_are_trusted(&child)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// True when nobody but SYSTEM and Administrators could have put or changed anything in the
+/// directory: it and everything in it are owned by them, nothing in it is a link, and any other
+/// account has at most read access (the original release let Users read the folder). Uninstall
+/// and repair check this before they read state from, or run anything in, an existing folder.
+pub fn is_trusted_directory(path: &Path) -> Result<bool> {
+    if !path.is_dir() || is_reparse(path)? {
+        return Ok(false);
+    }
+    let sddl = path_sddl(path)?;
+    let Some((owner, _, aces)) = parse_sddl(&sddl) else {
+        return Ok(false);
+    };
+    let acl_ok = aces.iter().all(|ace| {
+        let parts = ace.split(';').collect::<Vec<_>>();
+        parts.len() == 6
+            && (parts[0] == "D"
+                || TRUSTED_SIDS.contains(&parts[5])
+                || (parts[0] == "A" && rights_are_read_only(parts[2])))
+    });
+    Ok(TRUSTED_SIDS.contains(&owner) && acl_ok && children_are_trusted(path)?)
+}
+
 /// Creates the directory with its final owner and ACL in one call, so there is no moment at
 /// which another account can put files into it. Fails if anything already exists at the path.
 pub fn create_protected_directory(path: &Path) -> Result<()> {
@@ -342,6 +393,9 @@ pub fn protect_existing_directory(path: &Path) -> Result<()> {
 fn check_children(directory: &Path) -> Result<()> {
     for entry in fs::read_dir(directory)? {
         let child = entry?.path();
+        if fs::symlink_metadata(&child).is_err() {
+            continue; // a temporary file that has since been renamed
+        }
         if is_reparse(&child)? {
             bail!("{} is a link; remove it and try again", child.display());
         }
@@ -391,18 +445,6 @@ pub fn watchdog_lock_owner(path: &Path) -> u32 {
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .unwrap_or(0)
-}
-
-fn terminate_process(process_id: u32) {
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, process_id) };
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        TerminateProcess(handle, 1);
-        WaitForSingleObject(handle, 5000);
-        CloseHandle(handle);
-    }
 }
 
 // ---------------------------------------------------------------- browser policy
@@ -736,28 +778,37 @@ impl PolicyRoot {
         baseline: Option<&Baseline>,
     ) -> Result<()> {
         let managed_entries = merge(&[entries, previous]);
+        let mut first_error = None;
         for target in &TARGETS {
-            let list_path = self.list_path(target);
-            let managed: HashSet<_> = target.list_entries(&managed_entries).into_iter().collect();
-            let others = self
-                .list_values(&list_path)
-                .into_iter()
-                .filter(|value| !managed.contains(value))
-                .collect::<Vec<_>>();
-            let base = baseline
-                .and_then(|baseline| baseline.section(target))
-                .map(|section| section.blocklist.clone())
-                .unwrap_or_default();
-            self.write_list(
-                &list_path,
-                &merge(&[&base, &others, &target.list_entries(entries)]),
-            )?;
-            let key = self.create(&self.key_path(target))?;
-            for (name, value) in target.values {
-                key.set_value(name, value)?;
+            // A failure on one browser must not leave the others unblocked.
+            let applied = (|| -> Result<()> {
+                let list_path = self.list_path(target);
+                let managed: HashSet<_> =
+                    target.list_entries(&managed_entries).into_iter().collect();
+                let others = self
+                    .list_values(&list_path)
+                    .into_iter()
+                    .filter(|value| !managed.contains(value))
+                    .collect::<Vec<_>>();
+                let base = baseline
+                    .and_then(|baseline| baseline.section(target))
+                    .map(|section| section.blocklist.clone())
+                    .unwrap_or_default();
+                self.write_list(
+                    &list_path,
+                    &merge(&[&base, &others, &target.list_entries(entries)]),
+                )?;
+                let key = self.create(&self.key_path(target))?;
+                for (name, value) in target.values {
+                    key.set_value(name, value)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = applied {
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Lifts the block: removes exactly the managed entries, keeps everything else, and
@@ -833,16 +884,62 @@ pub trait Host {
     fn delete_task(&self) -> Result<()>;
     /// Runs the watchdog of the original PowerShell release in its one-shot unlock mode.
     fn powershell_unlock(&self, script: &Path) -> Result<()>;
+    /// Ends watchdogs of the original PowerShell release, which took no lock.
+    fn stop_legacy_watchdogs(&self);
+    /// Ends a leftover watchdog that still holds the lock.
+    fn terminate_watchdog(&self, process_id: u32);
+    /// Creates a Start menu shortcut that opens `target`.
+    fn create_shortcut(&self, shortcut: &Path, target: &Path) -> Result<()>;
 }
 
 pub struct Scheduler;
 
+fn run_hidden(program: &Path, arguments: &[&OsStr]) -> Result<std::process::Output> {
+    Ok(Command::new(program)
+        .args(arguments)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output()?)
+}
+
+fn powershell() -> PathBuf {
+    system_executable(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// Runs a short PowerShell script without a window. The script travels encoded, never quoted.
+fn run_powershell(script: &str) -> Result<()> {
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let encoded = STANDARD.encode(bytes);
+    let output = run_hidden(
+        &powershell(),
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded.as_str(),
+        ]
+        .map(OsStr::new),
+    )?;
+    if !output.status.success() {
+        bail!(
+            "PowerShell reported an error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// A PowerShell single-quoted string literal.
+fn quoted(value: &Path) -> String {
+    format!("'{}'", value.display().to_string().replace('\'', "''"))
+}
+
 impl Scheduler {
     fn schtasks(arguments: &[&OsStr]) -> Result<std::process::Output> {
-        Ok(Command::new(system_executable("schtasks.exe"))
-            .args(arguments)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()?)
+        run_hidden(&system_executable("schtasks.exe"), arguments)
     }
 }
 
@@ -897,23 +994,51 @@ impl Host for Scheduler {
     }
 
     fn powershell_unlock(&self, script: &Path) -> Result<()> {
-        let status = Command::new(system_executable(r"WindowsPowerShell\v1.0\powershell.exe"))
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(script)
-            .arg("-Unlock")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .status()?;
-        if !status.success() {
+        let output = run_hidden(
+            &powershell(),
+            &[
+                OsStr::new("-NoProfile"),
+                OsStr::new("-NonInteractive"),
+                OsStr::new("-ExecutionPolicy"),
+                OsStr::new("Bypass"),
+                OsStr::new("-File"),
+                script.as_os_str(),
+                OsStr::new("-Unlock"),
+            ],
+        )?;
+        if !output.status.success() {
             bail!("the existing PowerShell watchdog could not lift its blocks");
         }
         Ok(())
+    }
+
+    fn stop_legacy_watchdogs(&self) {
+        let _ = run_powershell(
+            r#"Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*Chainlink\watchdog.ps1*' } | ForEach-Object { try { Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction Stop | Out-Null } catch { } }"#,
+        );
+    }
+
+    fn terminate_watchdog(&self, process_id: u32) {
+        // taskkill only acts if that process id really is a Chainlink or PowerShell process.
+        let pid = format!("PID eq {process_id}");
+        for image in ["chainlink.exe", "powershell.exe"] {
+            let image = format!("IMAGENAME eq {image}");
+            let _ = run_hidden(
+                &system_executable("taskkill.exe"),
+                &["/F", "/FI", pid.as_str(), "/FI", image.as_str()].map(OsStr::new),
+            );
+        }
+    }
+
+    fn create_shortcut(&self, shortcut: &Path, target: &Path) -> Result<()> {
+        run_powershell(&format!(
+            "$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut({}); \
+             $shortcut.TargetPath = {}; \
+             $shortcut.Description = 'Remove Chainlink without the USB key, using your recovery words.'; \
+             $shortcut.Save()",
+            quoted(shortcut),
+            quoted(target)
+        ))
     }
 }
 
@@ -1004,8 +1129,14 @@ fn task_actions(xml: &str) -> Vec<(String, String)> {
 pub struct Env {
     pub app_dir: PathBuf,
     pub policy: PolicyRoot,
-    /// The copy of the executable in the Start menu that offers emergency uninstall.
+    /// A copy of the executable that everyone can read and that offers emergency uninstall.
+    /// It lives under Program Files, which only administrators can write.
     pub emergency_stub: PathBuf,
+    /// The Start menu shortcut that opens the emergency stub.
+    pub emergency_shortcut: PathBuf,
+    /// The watchdog only looks for `<drive>:\Chainlink\chainlink.key`, so linking is refused
+    /// from anywhere else. The tests, which cannot write to a drive root, turn this off.
+    pub require_usb_layout: bool,
     last_once_message: Mutex<String>,
 }
 
@@ -1016,28 +1147,42 @@ struct AttemptState {
 }
 
 impl Env {
-    pub fn new(app_dir: PathBuf, policy: PolicyRoot, emergency_stub: PathBuf) -> Self {
+    pub fn new(
+        app_dir: PathBuf,
+        policy: PolicyRoot,
+        emergency_stub: PathBuf,
+        emergency_shortcut: PathBuf,
+    ) -> Self {
         Self {
             app_dir,
             policy,
             emergency_stub,
+            emergency_shortcut,
+            require_usb_layout: true,
             last_once_message: Mutex::new(String::new()),
         }
     }
 
     /// The real locations, resolved through Windows APIs rather than environment variables.
     pub fn system() -> Result<Self> {
-        let program_data = program_data_dir()?;
+        let program_data = known_folder(&FOLDERID_ProgramData, "ProgramData")?;
+        let program_files = known_folder(&FOLDERID_ProgramFiles, "Program Files")?;
         Ok(Self::new(
             program_data.join("Chainlink"),
             PolicyRoot::system(),
+            program_files.join("Chainlink").join(EMERGENCY_STUB_NAME),
             program_data
                 .join("Microsoft")
                 .join("Windows")
                 .join("Start Menu")
                 .join("Programs")
-                .join(EMERGENCY_STUB_NAME),
+                .join(EMERGENCY_SHORTCUT_NAME),
         ))
+    }
+
+    /// Written by uninstall just before it deletes the program folder; tells a watchdog to exit.
+    pub fn uninstall_marker(&self) -> PathBuf {
+        self.file("uninstalling")
     }
 
     pub fn file(&self, name: &str) -> PathBuf {
@@ -1144,10 +1289,14 @@ impl Env {
         let entries = self.installed_blocklist();
         let previous = self.applied_entries();
         // Record the entries before writing them, so an interrupted lock can still be undone.
-        self.write_applied(&merge(&[&previous, &entries]))?;
+        // The record is a convenience for unlock; failing to write it must never stop the lock.
+        if let Err(error) = self.write_applied(&merge(&[&previous, &entries])) {
+            self.log_once(&format!("Could not record applied entries: {error:#}"));
+        }
         self.policy
             .apply_lock(&entries, &previous, self.read_baseline().as_ref())?;
-        self.write_applied(&entries)
+        let _ = self.write_applied(&entries);
+        Ok(())
     }
 
     pub fn remove_lock(&self) -> Result<()> {
@@ -1211,6 +1360,10 @@ impl Env {
     /// prevents the key from unlocking this PC; the installed list simply stays in force.
     pub fn sync_blocklist(&self, root: &Path) -> String {
         let source = root.join("Chainlink").join("blocklist.txt");
+        // The watchdog runs as SYSTEM, so it must not follow a link on the USB to another file.
+        if is_reparse(&source).unwrap_or(false) {
+            return "blocklist.txt on the USB is a link, not a file".to_owned();
+        }
         match fs::metadata(&source) {
             Ok(metadata) if metadata.len() > MAX_USB_BLOCKLIST_BYTES => {
                 return "blocklist.txt on the USB is too large".to_owned();
@@ -1309,10 +1462,22 @@ impl Env {
 
     // ---- install, repair, uninstall
 
+    fn owns_task(&self, xml: &str) -> bool {
+        self.task_xml_is_genuine(xml) || self.task_xml_references_app_dir(xml)
+    }
+
     /// Stops the watchdog and returns the held lock, which keeps any new watchdog from starting
     /// until it is dropped. Returns None when there is no program folder.
     pub fn stop_watchdog(&self, host: &dyn Host, timeout: Duration) -> Result<Option<File>> {
-        host.stop_task();
+        if host
+            .query_task_xml()
+            .is_some_and(|xml| self.owns_task(&xml))
+        {
+            host.stop_task();
+        }
+        if self.file("watchdog.ps1").is_file() {
+            host.stop_legacy_watchdogs();
+        }
         if !self.app_dir.is_dir() {
             return Ok(None);
         }
@@ -1324,7 +1489,7 @@ impl Env {
             }
             let owner = watchdog_lock_owner(&lock_path);
             if owner != 0 && owner != std::process::id() {
-                terminate_process(owner);
+                host.terminate_watchdog(owner);
             }
             if Instant::now() > deadline {
                 bail!(
@@ -1346,6 +1511,17 @@ impl Env {
         }
     }
 
+    /// Refuses to go on when the program folder could have been written by a non-administrator.
+    fn require_trusted_program_folder(&self) -> Result<()> {
+        if fs::symlink_metadata(&self.app_dir).is_ok() && !is_trusted_directory(&self.app_dir)? {
+            bail!(
+                "{} was not created by Chainlink, or another account has been able to change it. Nothing in it was used. Delete that folder as Administrator and try again.",
+                self.app_dir.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Links this PC to the USB in `usb_dir`, or repairs an existing link. Returns new recovery
     /// words when this is the first link.
     pub fn install(
@@ -1355,7 +1531,14 @@ impl Env {
         source_exe: &Path,
         stop_timeout: Duration,
     ) -> Result<Option<Vec<String>>> {
+        if self.require_usb_layout && !usb_layout_ok(usb_dir) {
+            bail!(
+                r"Chainlink has to be started from the Chainlink folder at the top level of the USB drive (for example E:\Chainlink). It is running from {}.",
+                usb_dir.display()
+            );
+        }
         read_blocklist(&usb_dir.join("blocklist.txt"))?;
+        self.require_trusted_program_folder()?;
         let task = host.query_task_xml();
         let has_task = task
             .as_deref()
@@ -1371,29 +1554,34 @@ impl Env {
             read_key_token(&key_file)?;
         } else {
             atomic_write(&key_file, new_key_token()?.as_bytes())?;
-            let _ = Command::new(system_executable("attrib.exe"))
-                .arg("+h")
-                .arg(&key_file)
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
+            let _ = run_hidden(
+                &system_executable("attrib.exe"),
+                &[OsStr::new("+h"), key_file.as_os_str()],
+            );
         }
         let current_hash = usb_hash(usb_dir)?;
 
         // Program folder that only SYSTEM and Administrators can read or change. Everything in
         // it runs as SYSTEM, so a folder another account created or owns is never reused.
         let app = &self.app_dir;
-        if fs::symlink_metadata(app).is_ok() {
-            if !app.is_dir() || is_reparse(app)? {
-                bail!("{} must be a real directory", app.display());
-            }
-            if !has_task {
-                if fs::read_dir(app)?.next().is_some() {
-                    bail!(
-                        "{} already contains files but no Chainlink scheduled task exists; delete that folder as Administrator and link again",
-                        app.display()
-                    );
-                }
+        let mut existing = has_task;
+        if fs::symlink_metadata(app).is_ok() && !existing {
+            if fs::read_dir(app)?.next().is_none() {
                 fs::remove_dir(app)?;
+            } else if is_protected_directory(app)?
+                && ["chainlink.exe", "watchdog.ps1", "watchdog.py"]
+                    .iter()
+                    .any(|name| self.file(name).is_file())
+            {
+                // A Chainlink folder only administrators could have written, whose task is gone
+                // (for example after an interrupted uninstall). Repair it like any other
+                // install, so its blocks are lifted before a new baseline could ever be taken.
+                existing = true;
+            } else {
+                bail!(
+                    "{} already contains files but no Chainlink scheduled task exists. If Chainlink is installed, use Uninstall (or Chainlink Emergency Uninstall) first; otherwise delete that folder as Administrator, then link again.",
+                    app.display()
+                );
             }
         }
         let created = fs::symlink_metadata(app).is_err();
@@ -1408,15 +1596,18 @@ impl Env {
             usb_dir,
             source_exe,
             current_hash,
-            has_task,
+            existing,
             stop_timeout,
         );
         if result.is_err() && created {
             // A first-time link that fails leaves nothing behind, so it can simply be retried.
+            // The folder goes only once the task is gone: a SYSTEM task must never be left
+            // pointing at a path that any account could then recreate.
             host.stop_task();
-            let _ = self.delete_own_task(host);
-            let _ = fs::remove_file(&self.emergency_stub);
-            let _ = fs::remove_dir_all(app);
+            if self.delete_own_task(host).is_ok() && host.query_task_xml().is_none() {
+                self.remove_emergency_entry();
+                let _ = fs::remove_dir_all(app);
+            }
         }
         result
     }
@@ -1432,11 +1623,19 @@ impl Env {
     ) -> Result<Option<Vec<String>>> {
         // Hold the watchdog lock while files change, so no watchdog runs a half-replaced copy.
         let lock = self.stop_watchdog(host, stop_timeout)?;
-        let files = || -> Result<Option<Vec<String>>> {
+        let files = || -> Result<()> {
+            let _ = fs::remove_file(self.uninstall_marker());
             if upgrade {
                 self.unlock_installed(host)?; // lift the old copy's blocks before replacing it
             }
-            atomic_write(&self.file("chainlink.exe"), &fs::read(source_exe)?)?;
+            let executable = fs::read(source_exe)?;
+            atomic_write(&self.file("chainlink.exe"), &executable)?;
+            let baseline = self.file("policy-baseline.json");
+            if baseline.exists() && self.read_baseline().is_none() {
+                // Unreadable, so the unlock above already fell back to removing Chainlink's
+                // own values. Take a fresh one.
+                fs::remove_file(&baseline)?;
+            }
             self.capture_baseline()?;
             if self.read_baseline().is_none() {
                 bail!("could not save existing browser policy; installation stopped");
@@ -1444,7 +1643,7 @@ impl Env {
 
             let mut known = self.paired_hashes().into_iter().collect::<Vec<_>>();
             if !known.contains(&current_hash) {
-                known.push(current_hash);
+                known.push(current_hash.clone());
             }
             known.sort();
             atomic_write(
@@ -1455,17 +1654,21 @@ impl Env {
             parse_blocklist_bytes(&blocklist)?;
             atomic_write(&self.file("blocklist.txt"), &blocklist)?;
 
-            let words = if self.file("recovery.txt").exists() {
-                None
-            } else {
-                Some(self.replace_recovery_words()?)
-            };
-            atomic_write(&self.emergency_stub, &fs::read(source_exe)?)?;
-            Ok(words)
+            // Emergency uninstall: a readable copy of the program under Program Files, and a
+            // Start menu shortcut to it (which replaces the PowerShell release's shortcut).
+            if let Some(directory) = self.emergency_stub.parent() {
+                fs::create_dir_all(directory)?;
+            }
+            atomic_write(&self.emergency_stub, &executable)?;
+            host.create_shortcut(&self.emergency_shortcut, &self.emergency_stub)
         }();
         drop(lock);
-        let words = files?;
+        files?;
 
+        // The original release's watchdog takes no lock; make sure none started meanwhile.
+        if self.file("watchdog.ps1").is_file() {
+            host.stop_legacy_watchdogs();
+        }
         host.create_task(self)?;
         for obsolete in [
             "Chainlink.ps1",
@@ -1475,7 +1678,14 @@ impl Env {
         ] {
             let _ = fs::remove_file(self.file(obsolete));
         }
-        Ok(words)
+
+        // First time on this PC: recovery words for the accountability partner. Made last, so
+        // that if anything above fails the words are not stored without ever being shown.
+        if self.file("recovery.txt").exists() {
+            Ok(None)
+        } else {
+            self.replace_recovery_words().map(Some)
+        }
     }
 
     /// Removes Chainlink from this PC.
@@ -1484,10 +1694,20 @@ impl Env {
     /// every minute and would re-apply the blocks behind our back), then lift the blocks, and
     /// only then delete the files.
     pub fn uninstall(&self, host: &dyn Host, stop_timeout: Duration) -> Result<()> {
+        self.require_trusted_program_folder()?;
         let lock = self.stop_watchdog(host, stop_timeout)?;
         let unlocked = self
             .delete_own_task(host)
-            .and_then(|()| self.unlock_installed(host));
+            .and_then(|()| self.unlock_installed(host))
+            .and_then(|()| {
+                // Tell any watchdog that was already starting to exit instead of locking again.
+                // It can only get the lock after this point, and it checks for the marker once
+                // it has it.
+                if self.app_dir.is_dir() {
+                    fs::write(self.uninstall_marker(), b"")?;
+                }
+                Ok(())
+            });
         drop(lock);
         unlocked?;
 
@@ -1496,28 +1716,53 @@ impl Env {
             if is_reparse(app)? {
                 bail!("refusing to remove a reparse-point program directory");
             }
-            fs::remove_dir_all(app)?;
+            // A watchdog that is just exiting can hold the lock file for a moment; retry briefly.
+            let mut attempt = 0;
+            while let Err(error) = fs::remove_dir_all(app) {
+                attempt += 1;
+                if attempt >= 10 {
+                    return Err(error).with_context(|| format!("remove {}", app.display()));
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
         }
-        self.remove_emergency_stub();
+        self.remove_emergency_entry();
         Ok(())
     }
 
-    fn remove_emergency_stub(&self) {
-        let stub = &self.emergency_stub;
-        if !stub.exists() {
+    fn running_from_stub(&self) -> bool {
+        env::current_exe().is_ok_and(|current| same_path(&current, &self.emergency_stub))
+    }
+
+    /// Removes the Start menu shortcut and the emergency copy. A copy that is running right now
+    /// (emergency uninstall) stays until [`Env::remove_stub_after_exit`] is called.
+    fn remove_emergency_entry(&self) {
+        let _ = fs::remove_file(&self.emergency_shortcut);
+        if !self.running_from_stub() {
+            let _ = fs::remove_file(&self.emergency_stub);
+            if let Some(directory) = self.emergency_stub.parent() {
+                let _ = fs::remove_dir(directory); // only if empty
+            }
+        }
+    }
+
+    /// Call as the last thing before the emergency copy exits after a successful uninstall.
+    ///
+    /// A running executable cannot delete itself, so a short-lived helper retries for about
+    /// half a minute until this process is gone. The ping to the loopback address is only a
+    /// one-second delay that works without a console; nothing leaves this PC.
+    pub fn remove_stub_after_exit(&self) {
+        if !self.running_from_stub() || self.app_dir.exists() {
             return;
         }
-        let running_from_stub = env::current_exe().is_ok_and(|current| same_path(&current, stub));
-        if !running_from_stub {
-            let _ = fs::remove_file(stub);
-            return;
-        }
-        // A running executable cannot delete itself, so a short-lived helper does it once this
-        // process has exited. The ping to the loopback address is only a two-second delay that
-        // works without a console; nothing leaves this PC.
+        let stub = self.emergency_stub.display().to_string();
+        let directory = self
+            .emergency_stub
+            .parent()
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_default();
         let command = format!(
-            "/d /s /c \"ping -n 3 127.0.0.1 >nul & del /f /q \"{}\"\"",
-            stub.display()
+            "/d /s /c \"for /l %i in (1,1,30) do @(del /f /q \"{stub}\" >nul 2>&1 & if not exist \"{stub}\" (rmdir \"{directory}\" >nul 2>&1 & exit) else (ping -n 2 127.0.0.1 >nul))\""
         );
         let spawned = Command::new(system_executable("cmd.exe"))
             .raw_arg(command)
@@ -1531,7 +1776,7 @@ impl Env {
             // Fall back to removal at the next restart.
             unsafe {
                 MoveFileExW(
-                    wide(stub.as_os_str()).as_ptr(),
+                    wide(self.emergency_stub.as_os_str()).as_ptr(),
                     std::ptr::null(),
                     MOVEFILE_DELAY_UNTIL_REBOOT,
                 );
@@ -1595,6 +1840,11 @@ fn usb_root(usb_dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(format!("{}:\\", &display[..1])))
 }
 
+/// True when `usb_dir` is `<drive>:\Chainlink`, the only place the watchdog looks for the key.
+fn usb_layout_ok(usb_dir: &Path) -> bool {
+    usb_root(usb_dir).is_ok_and(|root| same_path(usb_dir, &root.join("Chainlink")))
+}
+
 /// The volume serial as text. The first form is used for new pairings. The second, without
 /// leading zeros, is accepted when matching so that pairings made by the PowerShell release
 /// keep working whichever way Windows formatted the number for it.
@@ -1634,7 +1884,9 @@ pub fn usb_hash(usb_dir: &Path) -> Result<String> {
 }
 
 fn key_matches(key_file: &Path, root: &Path, expected: &HashSet<String>) -> bool {
-    if !fs::metadata(key_file).is_ok_and(|metadata| metadata.len() <= 1024) {
+    if is_reparse(key_file).unwrap_or(true)
+        || !fs::metadata(key_file).is_ok_and(|metadata| metadata.len() <= 1024)
+    {
         return false;
     }
     let (Ok(token), Ok(serials)) = (read_key_token(key_file), volume_serials(root)) else {
@@ -1721,7 +1973,7 @@ impl Watchdog {
     }
 
     fn without_key(&mut self, env: &Env) -> Result<()> {
-        if self.state != LockState::Locked || (self.tick % 12 == 0 && !env.lock_intact()) {
+        if self.state != LockState::Locked || (self.tick.is_multiple_of(12) && !env.lock_intact()) {
             env.set_lock()?;
             env.log(if self.state == LockState::Locked {
                 "Blocks were changed outside Chainlink - re-applied."
@@ -1735,7 +1987,7 @@ impl Watchdog {
     }
 }
 
-/// Runs the watchdog until the process is stopped.
+/// Runs the watchdog until the process is stopped or Chainlink is uninstalled.
 pub fn run_watchdog(env: &Env) -> Result<()> {
     if !env.app_dir.is_dir() {
         return Ok(()); // uninstalled
@@ -1743,10 +1995,16 @@ pub fn run_watchdog(env: &Env) -> Result<()> {
     let Some(_lock) = open_watchdog_lock(&env.file("watchdog.lock"))? else {
         return Ok(()); // another watchdog, or an install or uninstall, holds the lock
     };
+    // Checked only after the lock is held: uninstall writes the marker while it holds the lock,
+    // so a watchdog that was already starting can never slip in behind it and lock again.
+    if env.uninstall_marker().exists() {
+        return Ok(());
+    }
     env.log("Watchdog started.");
     let mut watchdog = Watchdog::default();
-    loop {
+    while !env.uninstall_marker().exists() {
         watchdog.cycle(env, env.find_key().as_deref());
         thread::sleep(Duration::from_secs(5));
     }
+    Ok(())
 }

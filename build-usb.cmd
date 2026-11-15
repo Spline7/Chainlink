@@ -12,6 +12,11 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 copy /y "target\release\chainlink.exe" "Chainlink\chainlink.exe" >nul
+if %errorlevel% neq 0 (
+    popd
+    echo Could not copy the executable into the Chainlink folder.
+    exit /b 1
+)
 popd
 echo Built Chainlink\chainlink.exe
 endlocal

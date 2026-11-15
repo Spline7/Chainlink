@@ -5,7 +5,7 @@ Chainlink is a small, open-source website blocker for Windows 10 and 11 that use
 - **USB unplugged:** your blocklist is enforced in Chrome, Edge, Brave, and Firefox. Private/Incognito windows, guest mode, and new browser profiles are turned off so they can't be used to get around the blocks.
 - **USB plugged in:** all blocks are lifted, and you can edit the blocklist.
 
-It's meant to add friction, not to be unbreakable. Anyone with admin rights who knows what they're doing can remove it.
+It's meant to add friction, not to be unbreakable. If you lose the USB, your accountability partner's recovery words let you uninstall it. Someone with admin rights and technical know-how could still remove it by hand.
 
 **Privacy:** Chainlink makes no network requests and has no telemetry, accounts, or cloud services. It is three plain-text scripts that you can read in Notepad.
 
@@ -64,15 +64,19 @@ The list is stored in `Chainlink\blocklist.txt` on the USB, so you can also edit
 
 This removes the background task, every browser block, and the program folder (`C:\ProgramData\Chainlink`). Your USB keeps working for any other PCs it's linked to.
 
-### Lost or broken USB
+### Lost or broken USB: recovery words
 
-1. Download this project from GitHub (Code -> Download ZIP) and unzip it.
-2. Open the Start menu, type **PowerShell**, right-click it, and choose **Run as administrator**.
-3. Run (adjust the path to where you unzipped it):
-   ```
-   powershell -ExecutionPolicy Bypass -File "C:\Users\YOU\Downloads\Chainlink\Chainlink\Chainlink.ps1" -Emergency
-   ```
-4. Type `UNINSTALL` when asked.
+The first time you link a PC, Chainlink shows **6 recovery words** for that PC. Give them to an accountability partner (a friend or family member), and don't keep a copy yourself. Each PC you link gets its own set of words.
+
+If your USB is ever lost:
+
+1. Ask your partner for the recovery words for that PC.
+2. Open the Start menu and click **Chainlink Emergency Uninstall**, then click **Yes** on the admin prompt.
+3. Type each word into its box, then click **Uninstall Chainlink**.
+
+You can't get around this without asking your partner, which is the point. A wrong guess adds a short delay before you can try again.
+
+If your partner loses the words, plug in your USB, open Chainlink, and click **New recovery words**. The old words stop working.
 
 ## How it works
 
@@ -82,6 +86,7 @@ This removes the background task, every browser block, and the program folder (`
   - **Not found:** it writes the blocklist into the browsers' policy settings in the registry (`URLBlocklist` for Chrome/Edge/Brave, `WebsiteFilter` for Firefox). It also turns off Incognito/InPrivate, guest mode, and adding profiles. About once a minute it checks whether those settings were changed and puts them back.
   - **Found:** it removes those settings and copies `blocklist.txt` from the USB if the file changed.
 - Only SYSTEM and Administrators can modify `C:\ProgramData\Chainlink`.
+- **Recovery words** are 6 words picked at random from a built-in list of 256. The PC stores only a salted, slow hash of them (PBKDF2, 100,000 rounds), never the words themselves.
 
 ## License
 

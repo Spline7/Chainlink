@@ -1,10 +1,10 @@
-use crate::core::{SHORTS_ENTRY, atomic_write, normalize_channel, normalize_entry, read_blocklist};
-use crate::windows;
-use anyhow::{Context, Result};
+use anyhow::Result;
+use chainlink_blocker::core::{
+    SHORTS_ENTRY, atomic_write, normalize_channel, normalize_entry, read_blocklist,
+};
+use chainlink_blocker::windows;
 use native_windows_gui as nwg;
-use std::cell::RefCell;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 fn confirm(parent: &nwg::Window, content: &str) -> bool {

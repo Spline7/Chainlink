@@ -1048,11 +1048,6 @@ pub fn watchdog() -> Result<()> {
         tick += 1;
         thread::sleep(Duration::from_secs(5));
     }
-    #[allow(unreachable_code)]
-    {
-        release_watchdog_mutex(mutex);
-        Ok(())
-    }
 }
 
 pub fn write_disabled_task_xml(path: &Path) -> Result<()> {

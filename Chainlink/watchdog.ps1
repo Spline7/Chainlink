@@ -107,7 +107,15 @@ function Read-Baseline {
     }
 }
 
-function Get-Blocklist { return @(Get-ChainlinkBlocklist -Path $BlocklistFile) }
+function Get-Blocklist {
+    try {
+        if (-not (Test-Path -LiteralPath $BlocklistFile -PathType Leaf)) { throw 'Installed blocklist is missing.' }
+        return @(Get-ChainlinkBlocklist -Path $BlocklistFile)
+    } catch {
+        Write-Log "Installed blocklist is invalid; blocking all URLs as a fail-safe: $($_.Exception.Message)"
+        return @('*')
+    }
+}
 
 function Get-FirefoxPatterns {
     param([Parameter(Mandatory = $true)][string]$Entry)
@@ -130,7 +138,7 @@ function Get-UniqueStrings {
 }
 
 function Set-ListValues {
-    param([string]$Path, [string[]]$Values)
+    param([string]$Path, [AllowEmptyCollection()][string[]]$Values)
     if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
     if ($Values.Count -eq 0) { return }
     New-Item -Path $Path -Force | Out-Null
@@ -159,7 +167,7 @@ function Restore-Property {
 }
 
 function Get-UnmanagedCurrentValues {
-    param([string]$Path, [string[]]$ManagedValues)
+    param([string]$Path, [AllowEmptyCollection()][string[]]$ManagedValues)
     $managed = @{}
     foreach ($value in $ManagedValues) { $managed[$value] = $true }
     return @(Get-ListSnapshot $Path | ForEach-Object { [string]$_.Value } | Where-Object { -not $managed.ContainsKey($_) })
@@ -264,11 +272,17 @@ function Find-Key {
     return $null
 }
 
-function Sync-Blocklist {
+function Test-UsbBlocklist {
     param([Parameter(Mandatory = $true)][string]$UsbRoot)
     $source = Join-Path $UsbRoot 'Chainlink\blocklist.txt'
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'The paired USB is missing blocklist.txt.' }
     [void](Get-ChainlinkBlocklist -Path $source)
+    return $source
+}
+
+function Sync-Blocklist {
+    param([Parameter(Mandatory = $true)][string]$UsbRoot)
+    $source = Test-UsbBlocklist $UsbRoot
     $same = (Test-Path -LiteralPath $BlocklistFile -PathType Leaf) -and ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath $BlocklistFile).Hash)
     if (-not $same) {
         $temporary = Join-Path $AppDir ('.blocklist-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
@@ -295,13 +309,14 @@ try {
         try {
             $usb = Find-Key
             if ($usb) {
-                Sync-Blocklist $usb
+                [void](Test-UsbBlocklist $usb)
                 if ($state -ne 'unlocked') {
                     Remove-Lock
                     $state = 'unlocked'
                     Set-Status "UNLOCKED - key found on $usb"
                     Write-Log "Key found on $usb - blocks lifted."
                 }
+                Sync-Blocklist $usb
             } elseif ($state -ne 'locked' -or (($tick % 12) -eq 0 -and -not (Test-LockIntact))) {
                 Set-Lock
                 if ($state -eq 'locked') { Write-Log 'Blocks were changed outside Chainlink - re-applied.' }

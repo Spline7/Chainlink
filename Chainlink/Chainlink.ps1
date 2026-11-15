@@ -14,7 +14,7 @@ $me = New-Object Security.Principal.WindowsPrincipal([Security.Principal.Windows
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $relaunch = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
     if ($Emergency) { $relaunch += ' -Emergency' }
-    try { Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList $relaunch } catch {}
+    try { Start-Process (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -WindowStyle Hidden -ArgumentList $relaunch } catch {}
     exit
 }
 
@@ -25,12 +25,14 @@ $BlocklistPath = Join-Path $UsbDir 'blocklist.txt'
 $AppDir        = Join-Path $env:ProgramData 'Chainlink'
 $PairFile      = Join-Path $AppDir 'pair.txt'
 $TaskName      = 'Chainlink'
+$TaskPath      = '\'
 $ShortsEntry   = 'youtube.com/shorts'
 $RecoveryFile  = Join-Path $AppDir 'recovery.txt'
 $RecoveryAttemptsFile = Join-Path $AppDir 'recovery-attempts.txt'
 $ShortcutPath  = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Chainlink Emergency Uninstall.lnk'
 $WordCount     = 6
 $CommonModule  = Join-Path $PSScriptRoot 'Chainlink.Common.psm1'
+$PowerShellExe = Join-Path $PSHOME 'powershell.exe'
 Import-Module $CommonModule -Force
 
 # Recovery words are picked from this list.
@@ -76,7 +78,19 @@ function Get-UsbHash {
     return Get-Hash "$token|$serial"
 }
 
-function Test-Installed { return [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) }
+function Test-ChainlinkTask {
+    $tasks = @(Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue)
+    foreach ($task in $tasks) {
+        foreach ($action in @($task.Actions)) {
+            if ($action.Execute -match '(?i)(^|\\)powershell\.exe$' -and $action.Arguments -like '*Chainlink\watchdog.ps1*') { return $true }
+        }
+    }
+    return $false
+}
+
+function Test-Installed {
+    return (Test-ChainlinkTask) -or (Test-Path -LiteralPath (Join-Path $AppDir 'watchdog.ps1') -PathType Leaf)
+}
 
 function Test-UsbMatchesPc {
     if (-not (Test-Path $PairFile)) { return $false }
@@ -196,6 +210,12 @@ function Register-RecoveryFailure {
 # ================================================================ link / uninstall
 
 function Install-Chainlink {
+    $hasExistingChainlinkTask = Test-ChainlinkTask
+    $namedTasks = @(Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue)
+    if ($namedTasks.Count -gt 0 -and -not $hasExistingChainlinkTask) {
+        throw "A scheduled task named '$TaskName' already exists and does not belong to Chainlink. Rename it before linking this PC."
+    }
+
     # 1. Create the secret key file on the USB the first time (reused for every PC you link).
     if (-not (Test-Path -LiteralPath $KeyFile)) {
         $bytes = New-Object byte[] 32
@@ -212,25 +232,30 @@ function Install-Chainlink {
         if (-not $appItem.PSIsContainer -or ($appItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw "$AppDir must be a real directory, not a file, junction, or symbolic link."
         }
+        if (-not $hasExistingChainlinkTask -and @(Get-ChildItem -LiteralPath $AppDir -Force).Count -gt 0) {
+            throw "$AppDir already contains files but no genuine Chainlink scheduled task exists. Move that directory aside before linking so untrusted files cannot be executed as Administrator."
+        }
     } else { New-Item -ItemType Directory -Path $AppDir | Out-Null }
-    & icacls.exe $AppDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+    & icacls.exe $AppDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not secure the Chainlink program directory.' }
+    & icacls.exe $AppDir /remove:g '*S-1-5-32-545' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not remove ordinary-user access from the Chainlink program directory.' }
 
     # Stop the old copy before replacing it. On an upgrade from the original release,
     # first unlock with that copy so the new watchdog can capture a clean policy baseline.
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
     $installedWatchdog = Join-Path $AppDir 'watchdog.ps1'
     $baselinePath = Join-Path $AppDir 'policy-baseline.json'
-    if (-not (Test-Path -LiteralPath $baselinePath) -and (Test-Path -LiteralPath $installedWatchdog)) {
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installedWatchdog -Unlock
+    if ($hasExistingChainlinkTask -and -not (Test-Path -LiteralPath $baselinePath) -and (Test-Path -LiteralPath $installedWatchdog)) {
+        & $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installedWatchdog -Unlock
         if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the existing installation for upgrade.' }
     }
 
     Copy-Item -LiteralPath (Join-Path $UsbDir 'Chainlink.Common.psm1') -Destination $AppDir -Force
     Copy-Item -LiteralPath (Join-Path $UsbDir 'watchdog.ps1') -Destination $AppDir -Force
     if (-not (Test-Path -LiteralPath $baselinePath)) {
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $AppDir 'watchdog.ps1') -CaptureBaseline
+        & $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $AppDir 'watchdog.ps1') -CaptureBaseline
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $baselinePath)) {
             throw 'Could not save the existing browser policies; installation was stopped to avoid overwriting them.'
         }
@@ -254,13 +279,17 @@ function Install-Chainlink {
     # Start menu shortcut for emergency uninstall (needs the recovery words).
     $sh = New-Object -ComObject WScript.Shell
     $lnk = $sh.CreateShortcut($ShortcutPath)
-    $lnk.TargetPath = 'powershell.exe'
-    $lnk.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AppDir\Chainlink.ps1`" -Emergency"
+    $installedMain = (Join-Path $AppDir 'Chainlink.ps1').Replace("'", "''")
+    $quotedPowerShell = $PowerShellExe.Replace("'", "''")
+    $elevate = "Start-Process -FilePath '$quotedPowerShell' -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','$installedMain','-Emergency')"
+    $encodedElevate = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($elevate))
+    $lnk.TargetPath = $PowerShellExe
+    $lnk.Arguments = "-NoProfile -WindowStyle Hidden -EncodedCommand $encodedElevate"
     $lnk.Description = 'Remove Chainlink without the USB key, using your recovery words.'
     $lnk.Save()
 
     # 5. Scheduled task: starts at boot, and every minute makes sure it is still running.
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    $action = New-ScheduledTaskAction -Execute $PowerShellExe `
         -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AppDir\watchdog.ps1`""
     $atBoot = New-ScheduledTaskTrigger -AtStartup
     $every  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
@@ -268,9 +297,9 @@ function Install-Chainlink {
     $set    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
                 -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
                 -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $atBoot, $every -Principal $who -Settings $set `
+    Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Action $action -Trigger $atBoot, $every -Principal $who -Settings $set `
         -Description 'Chainlink: blocks distracting websites unless the paired USB key is plugged in.' -Force | Out-Null
-    Start-ScheduledTask -TaskName $TaskName
+    Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
 
     # 6. First time on this PC: create recovery words for the accountability partner.
     if (-not (Test-Path $RecoveryFile)) {
@@ -282,8 +311,7 @@ function Install-Chainlink {
 }
 
 function Uninstall-Chainlink {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
         Where-Object { $_.CommandLine -like '*Chainlink\watchdog.ps1*' } |
         ForEach-Object { Invoke-CimMethod -InputObject $_ -MethodName Terminate | Out-Null }
@@ -292,9 +320,12 @@ function Uninstall-Chainlink {
     $wd = Join-Path $AppDir 'watchdog.ps1'
     if (-not (Test-Path -LiteralPath $wd)) { $wd = Join-Path $UsbDir 'watchdog.ps1' }
     if (-not (Test-Path -LiteralPath $wd)) { throw 'The installed watchdog is missing; browser policies were not changed.' }
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $wd -Unlock
+    & $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $wd -Unlock
     if ($LASTEXITCODE -ne 0) { throw 'Could not restore browser policies; Chainlink files were left in place for recovery.' }
 
+    if (Test-ChainlinkTask) {
+        Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction Stop
+    }
     if (Test-Path -LiteralPath $ShortcutPath) { Remove-Item -LiteralPath $ShortcutPath -Force }
     if (Test-Path -LiteralPath $AppDir) { Remove-Item -LiteralPath $AppDir -Recurse -Force }
 }

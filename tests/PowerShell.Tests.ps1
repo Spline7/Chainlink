@@ -29,10 +29,12 @@ $idnUrl = 'https://b{0}cher.example' -f [char]0x00fc
 Assert-Equal 'xn--bcher-kva.example' (ConvertTo-ChainlinkEntry $idnUrl) 'normalizes IDN'
 Assert-Equal 'youtube.com/@SomeCreator' (ConvertTo-ChainlinkChannel '@SomeCreator') 'normalizes channel handle'
 Assert-Equal 'youtube.com/channel/UC123' (ConvertTo-ChainlinkChannel 'https://youtube.com/channel/UC123/videos') 'normalizes channel URL'
+Assert-Equal '[::1]:8080/path' (ConvertTo-ChainlinkEntry 'http://[::1]:8080/path/') 'normalizes IPv6 URL'
 Assert-Throws { ConvertTo-ChainlinkEntry 'file:///C:/Windows' } 'rejects non-web schemes'
 Assert-Throws { ConvertTo-ChainlinkEntry 'https://user:pass@example.com' } 'rejects credentials'
 Assert-Throws { ConvertTo-ChainlinkEntry 'https://example.com/?token=secret' } 'rejects query strings'
 Assert-Throws { ConvertTo-ChainlinkChannel 'https://example.com/not-youtube' } 'rejects non-YouTube channel URL'
+Assert-Throws { ConvertTo-ChainlinkChannel 'bad\handle' } 'rejects malformed channel handle'
 
 $left = [byte[]](1, 2, 3)
 Assert-True (Test-ChainlinkFixedTimeEqual $left ([byte[]](1, 2, 3))) 'fixed-time equality accepts equal values'
@@ -48,6 +50,8 @@ try {
     Assert-Equal 2 $entries.Count 'deduplicates blocklist'
     Assert-Equal 'example.com' $entries[0] 'first normalized entry'
     Assert-Equal 'youtube.com/shorts' $entries[1] 'second normalized entry'
+    Set-ChainlinkTextFileAtomic -Path $blocklist -Lines @('# an intentionally empty blocklist')
+    Assert-Equal 0 @(Get-ChainlinkBlocklist -Path $blocklist).Count 'accepts empty blocklist'
 } finally {
     Remove-Item -LiteralPath $tempDirectory -Recurse -Force
 }

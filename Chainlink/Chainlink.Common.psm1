@@ -58,8 +58,10 @@ function ConvertTo-ChainlinkEntry {
     }
 
     $hostName = $uri.IdnHost.TrimEnd('.').ToLowerInvariant()
-    if ($hostName.StartsWith('www.')) { $hostName = $hostName.Substring(4) }
-    if ($hostName -notmatch '^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$' -and $uri.HostNameType -ne [UriHostNameType]::IPv6) {
+    if ($uri.HostNameType -eq [UriHostNameType]::IPv6) {
+        $hostName = '[' + $hostName.Trim('[', ']') + ']'
+    } elseif ($hostName.StartsWith('www.')) { $hostName = $hostName.Substring(4) }
+    if ($uri.HostNameType -ne [UriHostNameType]::IPv6 -and $hostName -notmatch '^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$') {
         throw "Invalid website hostname: $Value"
     }
 
@@ -75,11 +77,12 @@ function ConvertTo-ChainlinkChannel {
 
     $value = $Value.Trim()
     if ($value -eq '') { return '' }
-    if ($value -match '^@?([^/?#\s]+)$') { return "youtube.com/@$($Matches[1])" }
+    if ($value -match '^@?([a-zA-Z0-9._-]{1,100})$') { return "youtube.com/@$($Matches[1])" }
 
     $entry = ConvertTo-ChainlinkEntry $value
-    if ($entry -match '^youtube\.com/(@[^/?#]+)(?:/(?:videos|shorts|featured|streams|playlists|community|about))?$') { return "youtube.com/$($Matches[1])" }
-    if ($entry -match '^youtube\.com/(channel|c|user)/([^/?#]+)(?:/(?:videos|shorts|featured|streams|playlists|community|about))?$') {
+    $entry = $entry -replace '^m\.youtube\.com/', 'youtube.com/'
+    if ($entry -match '^youtube\.com/(@[a-zA-Z0-9._-]{1,100})(?:/(?:videos|shorts|featured|streams|playlists|community|about))?$') { return "youtube.com/$($Matches[1])" }
+    if ($entry -match '^youtube\.com/(channel|c|user)/([a-zA-Z0-9._-]{1,128})(?:/(?:videos|shorts|featured|streams|playlists|community|about))?$') {
         return "youtube.com/$($Matches[1])/$($Matches[2])"
     }
     throw "Not a supported YouTube channel name or URL: $Value"

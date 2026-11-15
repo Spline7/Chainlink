@@ -18,22 +18,22 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, S_OK,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, S_OK, SYSTEMTIME,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DRIVE_FIXED, DRIVE_REMOVABLE, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::SystemInformation::{
-    GetLocalTime, GetWindowsDirectoryW, SYSTEMTIME,
-};
+use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
+use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramData, IsUserAnAdmin, SHGetKnownFolderPath, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use winreg::enums::{KEY_READ, KEY_WOW64_64KEY, KEY_WRITE};
-use winreg::{FromRegValue, HKLM, RegKey};
+use winreg::types::FromRegValue;
+use winreg::{HKLM, RegKey};
 
 const TASK_NAME: &str = r"\Chainlink";
 const REPARSE_POINT: u32 = 0x400;
@@ -1005,7 +1005,7 @@ pub fn release_watchdog_mutex(handle: HANDLE) {
 }
 
 pub fn watchdog() -> Result<()> {
-    let mutex = match acquire_watchdog_mutex() {
+    let _mutex = match acquire_watchdog_mutex() {
         Ok(handle) => handle,
         Err(error) if error.to_string().contains("already running") => return Ok(()),
         Err(error) => return Err(error),

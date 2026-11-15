@@ -9,7 +9,7 @@ It's meant to add friction, not to be unbreakable. If you lose the USB, your acc
 
 **Privacy:** Chainlink makes no network requests and has no telemetry, accounts, or cloud services. It is standard-library Python that you can inspect in any text editor.
 
-**Requirement:** install Python 3.10 or newer for all users on each Windows PC. A system-wide python.org installation is recommended because the background watchdog runs as the Windows SYSTEM account.
+**Requirement:** install Python 3.10 or newer for all users under `Program Files` on each Windows PC. This is required because the background watchdog runs as the Windows SYSTEM account and must not execute an interpreter from a user-writable location.
 
 ---
 

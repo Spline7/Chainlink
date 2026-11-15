@@ -40,6 +40,7 @@ from windows_support import (
     is_admin,
     is_reparse_point,
     relaunch_elevated,
+    read_baseline,
     remove_lock,
     secure_app_directory,
     stop_task,
@@ -68,9 +69,9 @@ def validated_runtime() -> Path:
     executable = Path(sys.executable).resolve()
     if not executable.is_file() or executable.suffix.lower() != ".exe":
         raise RuntimeError("Chainlink requires a normal Windows Python executable")
-    user_profile = Path(os.environ["USERPROFILE"]).resolve()
-    if executable.is_relative_to(user_profile) or "windowsapps" in {part.lower() for part in executable.parts}:
-        raise RuntimeError("the background task cannot rely on a per-user Python; install Python 3.10+ for all users and run Chainlink again")
+    trusted_roots = [Path(value).resolve() for name in ("ProgramFiles", "ProgramFiles(x86)") if (value := os.environ.get(name))]
+    if not any(executable.is_relative_to(root) for root in trusted_roots):
+        raise RuntimeError("the SYSTEM background task requires Python under Program Files; install Python 3.10+ for all users and run Chainlink again")
     return executable
 
 
@@ -174,7 +175,7 @@ def install_chainlink() -> list[str] | None:
         copy_atomic(USB_DIR / name, APP_DIR / name)
     if not BASELINE_FILE.exists():
         capture_baseline()
-    if not BASELINE_FILE.exists():
+    if read_baseline() is None:
         raise RuntimeError("could not save existing browser policy; installation stopped")
 
     known = []

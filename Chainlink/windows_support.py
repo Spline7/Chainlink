@@ -181,6 +181,27 @@ def read_baseline() -> dict[str, Any] | None:
         version = _get(baseline, "version", "Version")
         if version not in {1, 2}:
             raise ValueError("unsupported baseline version")
+        chromium = _get(baseline, "chromium", "Chromium")
+        firefox = _get(baseline, "firefox", "Firefox")
+        if not isinstance(chromium, dict) or not isinstance(firefox, dict):
+            raise ValueError("baseline is missing browser sections")
+        for browser, _path, private, add_profile in CHROMIUM:
+            item = _get(chromium, browser)
+            if not isinstance(item, dict) or not isinstance(_get(item, "blocklist", "Blocklist"), list):
+                raise ValueError(f"baseline is missing {browser} blocklist state")
+            properties = _get(item, "properties", "Properties")
+            if not isinstance(properties, dict):
+                raise ValueError(f"baseline is missing {browser} property state")
+            for name in (private, "BrowserGuestModeEnabled", add_profile, "TorDisabled"):
+                snapshot = _get(properties, name)
+                if not isinstance(snapshot, dict) or _get(snapshot, "present", "Present") is None:
+                    raise ValueError(f"baseline is missing {browser}/{name}")
+        if not isinstance(_get(firefox, "blocklist", "Blocklist"), list):
+            raise ValueError("baseline is missing Firefox blocklist state")
+        firefox_properties = _get(firefox, "properties", "Properties")
+        firefox_snapshot = _get(firefox_properties, "DisablePrivateBrowsing")
+        if not isinstance(firefox_snapshot, dict) or _get(firefox_snapshot, "present", "Present") is None:
+            raise ValueError("baseline is missing Firefox private-browsing state")
         return baseline
     except (OSError, ValueError, TypeError) as error:
         log(f"Policy baseline is unavailable or invalid; unrelated policies will be preserved: {error}")
@@ -270,6 +291,8 @@ def set_lock() -> None:
 def remove_lock() -> None:
     entries = installed_blocklist()
     baseline = read_baseline()
+    if baseline is None:
+        raise RuntimeError("cannot restore browser policy without a valid pre-install baseline")
     for browser, path, private, add_profile in CHROMIUM:
         block_path = path + r"\URLBlocklist"
         remaining = _unmanaged(block_path, entries)

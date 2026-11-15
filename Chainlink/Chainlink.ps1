@@ -81,9 +81,7 @@ function Get-UsbHash {
 function Test-ChainlinkTask {
     $tasks = @(Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue)
     foreach ($task in $tasks) {
-        foreach ($action in @($task.Actions)) {
-            if ($action.Execute -match '(?i)(^|\\)powershell\.exe$' -and $action.Arguments -like '*Chainlink\watchdog.ps1*') { return $true }
-        }
+        if (Test-ChainlinkScheduledTaskObject -Task $task -PowerShellExe $PowerShellExe -WatchdogPath (Join-Path $AppDir 'watchdog.ps1')) { return $true }
     }
     return $false
 }
@@ -241,13 +239,15 @@ function Install-Chainlink {
     & icacls.exe $AppDir /remove:g '*S-1-5-32-545' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not remove ordinary-user access from the Chainlink program directory.' }
 
-    # Stop the old copy before replacing it. On an upgrade from the original release,
-    # first unlock with that copy so the new watchdog can capture a clean policy baseline.
+    # Stop and unlock the old copy before replacing its blocklist or watchdog.
     Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
     $installedWatchdog = Join-Path $AppDir 'watchdog.ps1'
     $baselinePath = Join-Path $AppDir 'policy-baseline.json'
-    if ($hasExistingChainlinkTask -and -not (Test-Path -LiteralPath $baselinePath) -and (Test-Path -LiteralPath $installedWatchdog)) {
+    if ($hasExistingChainlinkTask) {
+        if (-not (Test-Path -LiteralPath $installedWatchdog -PathType Leaf)) {
+            throw 'The existing Chainlink task has no installed watchdog; installation was stopped.'
+        }
         & $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installedWatchdog -Unlock
         if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the existing installation for upgrade.' }
     }
@@ -276,6 +276,12 @@ function Install-Chainlink {
     }
     Get-ChildItem $AppDir -File | Unblock-File -ErrorAction SilentlyContinue
 
+    $newRecoveryWords = $null
+    if (-not (Test-Path $RecoveryFile)) {
+        $newRecoveryWords = New-RecoveryWords
+        Save-RecoveryWords $newRecoveryWords
+    }
+
     # Start menu shortcut for emergency uninstall (needs the recovery words).
     $sh = New-Object -ComObject WScript.Shell
     $lnk = $sh.CreateShortcut($ShortcutPath)
@@ -301,13 +307,7 @@ function Install-Chainlink {
         -Description 'Chainlink: blocks distracting websites unless the paired USB key is plugged in.' -Force | Out-Null
     Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
 
-    # 6. First time on this PC: create recovery words for the accountability partner.
-    if (-not (Test-Path $RecoveryFile)) {
-        $words = New-RecoveryWords
-        Save-RecoveryWords $words
-        return ,$words
-    }
-    return $null
+    return $newRecoveryWords
 }
 
 function Uninstall-Chainlink {

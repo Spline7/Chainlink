@@ -41,6 +41,22 @@ Assert-True (Test-ChainlinkFixedTimeEqual $left ([byte[]](1, 2, 3))) 'fixed-time
 Assert-True (-not (Test-ChainlinkFixedTimeEqual $left ([byte[]](1, 2, 4)))) 'fixed-time equality rejects different values'
 Assert-Equal 64 (Get-ChainlinkSha256Hex 'chainlink').Length 'SHA-256 hex length'
 
+$watchdogPath = 'C:\ProgramData\Chainlink\watchdog.ps1'
+$powershellPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+$validTask = [pscustomobject]@{
+    Principal = [pscustomobject]@{ UserId = 'SYSTEM' }
+    Actions = @([pscustomobject]@{
+        Execute = $powershellPath
+        Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchdogPath`""
+    })
+}
+Assert-True (Test-ChainlinkScheduledTaskObject $validTask $powershellPath $watchdogPath) 'accepts exact SYSTEM watchdog task'
+$validTask.Principal.UserId = 'ordinary-user'
+Assert-True (-not (Test-ChainlinkScheduledTaskObject $validTask $powershellPath $watchdogPath)) 'rejects non-SYSTEM task collision'
+$validTask.Principal.UserId = 'SYSTEM'
+$validTask.Actions[0].Arguments += ' -Command malicious'
+Assert-True (-not (Test-ChainlinkScheduledTaskObject $validTask $powershellPath $watchdogPath)) 'rejects altered watchdog action'
+
 $tempDirectory = Join-Path ([IO.Path]::GetTempPath()) ('chainlink-tests-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempDirectory | Out-Null
 try {

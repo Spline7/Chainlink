@@ -131,11 +131,35 @@ function Set-ChainlinkTextFileAtomic {
     }
 }
 
+function Test-ChainlinkScheduledTaskObject {
+    param(
+        [Parameter(Mandatory = $true)]$Task,
+        [Parameter(Mandatory = $true)][string]$PowerShellExe,
+        [Parameter(Mandatory = $true)][string]$WatchdogPath
+    )
+
+    if ($null -eq $Task.Principal) { return $false }
+    $userId = [string]$Task.Principal.UserId
+    if ($userId -notin @('SYSTEM', 'S-1-5-18')) { return $false }
+
+    $currentArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WatchdogPath`""
+    $legacyArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WatchdogPath`""
+    foreach ($action in @($Task.Actions)) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$action.Execute, $PowerShellExe) -and
+            ([StringComparer]::OrdinalIgnoreCase.Equals([string]$action.Arguments, $currentArguments) -or
+             [StringComparer]::OrdinalIgnoreCase.Equals([string]$action.Arguments, $legacyArguments))) {
+            return $true
+        }
+    }
+    return $false
+}
+
 Export-ModuleMember -Function @(
     'Get-ChainlinkSha256Hex',
     'Test-ChainlinkFixedTimeEqual',
     'ConvertTo-ChainlinkEntry',
     'ConvertTo-ChainlinkChannel',
     'Get-ChainlinkBlocklist',
-    'Set-ChainlinkTextFileAtomic'
+    'Set-ChainlinkTextFileAtomic',
+    'Test-ChainlinkScheduledTaskObject'
 )

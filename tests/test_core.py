@@ -93,7 +93,9 @@ class SourceTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows Task Scheduler XML")
     def test_task_xml_uses_system_principal_and_absolute_paths(self) -> None:
-        from windows_support import APP_DIR, PROGRAM_FILES_ROOTS, task_xml, task_xml_is_genuine
+        from unittest.mock import patch
+
+        from windows_support import APP_DIR, PROGRAM_DATA, PROGRAM_FILES_ROOTS, system_executable, task_xml, task_xml_is_genuine
 
         trusted_python = PROGRAM_FILES_ROOTS[0] / "Python312" / "python.exe"
         xml = task_xml(trusted_python, APP_DIR / "watchdog.py")
@@ -103,6 +105,9 @@ class SourceTests(unittest.TestCase):
         self.assertIn(str(trusted_python), xml)
         self.assertTrue(task_xml_is_genuine(xml))
         self.assertFalse(task_xml_is_genuine(f"<Task><Principals><UserId>ordinary-user</UserId></Principals><Description>{trusted_python}</Description></Task>"))
+        with patch.dict(os.environ, {"ProgramData": r"C:\Chainlink-Evil", "SystemRoot": r"C:\Chainlink-Evil"}):
+            self.assertEqual(PROGRAM_DATA / "Chainlink", APP_DIR)
+            self.assertNotIn("Chainlink-Evil", str(system_executable("schtasks.exe")))
 
 
 if __name__ == "__main__":

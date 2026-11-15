@@ -1,22 +1,30 @@
-"""Chainlink's Windows settings, installation, recovery, and uninstall UI."""
+"""Chainlink's Windows settings, installation, recovery, and uninstall UI.
+
+Started by Chainlink.cmd on the USB drive. Makes no network requests and sends no telemetry.
+"""
 
 from __future__ import annotations
 
 import argparse
-import base64
+import ctypes
 import json
-import os
 import shutil
 import subprocess
 import sys
 import time
-import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
 
-from chainlink_core import (
+# Python is started in isolated mode, which does not add this folder to the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import tkinter as tk  # noqa: E402
+from tkinter import messagebox, ttk  # noqa: E402
+
+import windows_support as ws  # noqa: E402
+from chainlink_core import (  # noqa: E402
     SHORTS_ENTRY,
-    WORD_LIST,
+    ValidationError,
+    atomic_write_bytes,
     atomic_write_text,
     make_recovery_record,
     new_key_token,
@@ -28,38 +36,24 @@ from chainlink_core import (
     read_key_token,
     verify_recovery_record,
 )
-from windows_support import (
-    APP_DIR,
-    BASELINE_FILE,
-    BLOCKLIST_FILE,
-    PAIR_FILE,
-    PROGRAM_DATA,
-    PROGRAM_FILES_ROOTS,
-    capture_baseline,
-    create_task,
-    delete_task,
-    genuine_task,
-    is_admin,
-    is_reparse_point,
-    relaunch_elevated,
-    read_baseline,
-    remove_lock,
-    secure_app_directory,
-    stop_task,
-    system_executable,
-    volume_serial,
-)
 
 USB_DIR = Path(__file__).resolve().parent
 USB_ROOT = Path(USB_DIR.anchor)
 KEY_FILE = USB_DIR / "chainlink.key"
 USB_BLOCKLIST = USB_DIR / "blocklist.txt"
-RECOVERY_FILE = APP_DIR / "recovery.txt"
-RECOVERY_ATTEMPTS = APP_DIR / "recovery-attempts.json"
-START_MENU = PROGRAM_DATA / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+START_MENU = ws.PROGRAM_DATA / "Microsoft" / "Windows" / "Start Menu" / "Programs"
 EMERGENCY_COMMAND = START_MENU / "Chainlink Emergency Uninstall.cmd"
 EMERGENCY_LAUNCHER = START_MENU / "Chainlink Emergency Uninstall.pyw"
 INSTALL_FILES = ("chainlink.py", "chainlink_core.py", "windows_support.py", "watchdog.py")
+PYTHON_FLAGS = ("-I", "-B")  # isolated from PYTHON* variables and per-user site-packages; no .pyc files
+
+
+def recovery_file() -> Path:
+    return ws.app_file("recovery.txt")
+
+
+def recovery_attempts_file() -> Path:
+    return ws.app_file("recovery-attempts.json")
 
 
 def pythonw_executable() -> Path:
@@ -71,7 +65,7 @@ def validated_runtime() -> Path:
     executable = Path(sys.executable).resolve()
     if not executable.is_file() or executable.suffix.lower() != ".exe":
         raise RuntimeError("Chainlink requires a normal Windows Python executable")
-    if not re_python_executable(executable.name) or not any(executable.is_relative_to(root) for root in PROGRAM_FILES_ROOTS):
+    if not re_python_executable(executable.name) or not any(executable.is_relative_to(root) for root in ws.PROGRAM_FILES_ROOTS):
         raise RuntimeError("the SYSTEM background task requires Python under Program Files; install Python 3.10+ for all users and run Chainlink again")
     return executable
 
@@ -88,24 +82,15 @@ def re_python_executable(name: str) -> bool:
 def usb_hash() -> str:
     if not USB_ROOT.anchor:
         raise RuntimeError("Chainlink must be run from a drive with a Windows volume serial number")
-    return pairing_hash(read_key_token(KEY_FILE), volume_serial(str(USB_ROOT)))
+    return pairing_hash(read_key_token(KEY_FILE), ws.volume_serial(str(USB_ROOT)))
 
 
 def usb_matches_pc() -> bool:
-    try:
-        expected = {line.strip().lower() for line in PAIR_FILE.read_text(encoding="utf-8-sig").splitlines()}
-        return usb_hash() in expected
-    except (OSError, ValueError):
-        return False
+    return bool(USB_ROOT.anchor) and ws.key_matches(KEY_FILE, str(USB_ROOT), ws.paired_hashes())
 
 
 def copy_atomic(source: Path, destination: Path) -> None:
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    try:
-        shutil.copy2(source, temporary)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_bytes(destination, source.read_bytes())
 
 
 def create_key_if_needed() -> None:
@@ -113,18 +98,18 @@ def create_key_if_needed() -> None:
         read_key_token(KEY_FILE)
         return
     KEY_FILE.write_text(new_key_token(), encoding="ascii")
-    attributes = 0x2  # FILE_ATTRIBUTE_HIDDEN
-    if not __import__("ctypes").windll.kernel32.SetFileAttributesW(str(KEY_FILE), attributes):
-        raise __import__("ctypes").WinError()
+    ws.kernel32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    if not ws.kernel32.SetFileAttributesW(str(KEY_FILE), 0x2):  # FILE_ATTRIBUTE_HIDDEN
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def write_recovery(words: list[str]) -> None:
-    atomic_write_text(RECOVERY_FILE, make_recovery_record(words) + "\n")
+    atomic_write_text(recovery_file(), make_recovery_record(words) + "\n")
 
 
 def recovery_delay() -> int:
     try:
-        state = json.loads(RECOVERY_ATTEMPTS.read_text(encoding="utf-8"))
+        state = json.loads(recovery_attempts_file().read_text(encoding="utf-8"))
         return max(0, int(state["until"] - time.time() + 0.999))
     except (OSError, ValueError, TypeError, KeyError):
         return 0
@@ -132,12 +117,32 @@ def recovery_delay() -> int:
 
 def register_recovery_failure() -> None:
     try:
-        state = json.loads(RECOVERY_ATTEMPTS.read_text(encoding="utf-8"))
+        state = json.loads(recovery_attempts_file().read_text(encoding="utf-8"))
         failures = int(state.get("failures", 0))
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         failures = 0
     failures = min(6, failures + 1)
-    atomic_write_text(RECOVERY_ATTEMPTS, json.dumps({"failures": failures, "until": time.time() + min(60, 2 ** (failures + 1))}) + "\n")
+    atomic_write_text(recovery_attempts_file(), json.dumps({"failures": failures, "until": time.time() + min(60, 2 ** (failures + 1))}) + "\n")
+
+
+def run_powershell_watchdog(script: Path, mode: str) -> None:
+    """Run a watchdog left by a PowerShell release in one of its one-shot modes."""
+    powershell = ws.system_executable(r"WindowsPowerShell\v1.0\powershell.exe")
+    subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), mode],
+        check=True,
+        capture_output=True,
+    )
+
+
+def unlock_installed() -> None:
+    """Lift the blocks of whatever is installed on this PC."""
+    old_powershell = ws.app_file("watchdog.ps1")
+    if old_powershell.is_file() and not ws.app_file("policy-baseline.json").exists():
+        # The original release kept no record of earlier policy; its own code undoes what it did.
+        run_powershell_watchdog(old_powershell, "-Unlock")
+    else:
+        ws.remove_lock()
 
 
 def install_chainlink() -> list[str] | None:
@@ -147,102 +152,135 @@ def install_chainlink() -> list[str] | None:
     read_blocklist(USB_BLOCKLIST)
     runtime = validated_runtime()
 
-    has_task = genuine_task()
-    task_xml = subprocess.run(
-        [str(system_executable("schtasks.exe")), "/Query", "/TN", r"\Chainlink", "/XML"],
-        text=True,
-        capture_output=True,
-    )
-    if task_xml.returncode == 0 and not has_task:
+    task = ws.query_task_xml()
+    has_task = bool(task and ws.task_xml_is_genuine(task))
+    if task and not has_task:
         raise RuntimeError("a scheduled task named Chainlink already exists and does not belong to this application")
 
     create_key_if_needed()
     current_hash = usb_hash()
-    if APP_DIR.exists():
-        if not APP_DIR.is_dir() or is_reparse_point(APP_DIR):
-            raise RuntimeError(f"{APP_DIR} must be a real directory, not a file, junction, or symbolic link")
-        if not has_task and any(APP_DIR.iterdir()):
-            raise RuntimeError(f"{APP_DIR} contains files but no genuine Chainlink task exists; move it aside before linking")
+
+    # Program folder that only SYSTEM and Administrators can read or change. Everything in it
+    # runs as SYSTEM, so a folder another account created or owns is never reused.
+    app_dir = ws.APP_DIR
+    if app_dir.exists() or app_dir.is_symlink():
+        if not app_dir.is_dir() or ws.is_reparse_point(app_dir):
+            raise RuntimeError(f"{app_dir} must be a real directory, not a file, junction, or symbolic link")
+        if not has_task:
+            if any(app_dir.iterdir()):
+                raise RuntimeError(f"{app_dir} already contains files but no Chainlink scheduled task exists; delete that folder as Administrator and link again")
+            app_dir.rmdir()
+    created = not app_dir.exists()
+    if created:
+        ws.create_protected_directory(app_dir)
     else:
-        APP_DIR.mkdir()
-    secure_app_directory()
+        ws.protect_existing_directory(app_dir)
 
-    stop_task()
-    if has_task and BASELINE_FILE.exists():
-        remove_lock()
-    elif has_task:
-        old_python = APP_DIR / "watchdog.py"
-        old_powershell = APP_DIR / "watchdog.ps1"
-        if old_python.is_file():
-            subprocess.run([sys.executable, "-B", str(old_python), "--unlock"], check=True)
-        elif old_powershell.is_file():
-            subprocess.run(
-                [str(system_executable(r"WindowsPowerShell\v1.0\powershell.exe")), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(old_powershell), "-Unlock"],
-                check=True,
-            )
-        else:
-            raise RuntimeError("the existing Chainlink task has no watchdog to migrate")
+    try:
+        return install_files(runtime, current_hash, has_task)
+    except BaseException:
+        if created:
+            # A first-time link that fails leaves nothing behind, so it can simply be tried again.
+            try:
+                ws.stop_task()
+                ws.delete_task()
+            except Exception:
+                pass
+            EMERGENCY_COMMAND.unlink(missing_ok=True)
+            EMERGENCY_LAUNCHER.unlink(missing_ok=True)
+            shutil.rmtree(app_dir, ignore_errors=True)
+        raise
 
-    for name in INSTALL_FILES:
-        copy_atomic(USB_DIR / name, APP_DIR / name)
-    if not BASELINE_FILE.exists():
-        capture_baseline()
-    if read_baseline() is None:
-        raise RuntimeError("could not save existing browser policy; installation stopped")
 
-    known = []
-    if PAIR_FILE.exists():
-        known = [line.strip().lower() for line in PAIR_FILE.read_text(encoding="utf-8-sig").splitlines() if re_full_hash(line.strip())]
-    if current_hash not in known:
-        known.append(current_hash)
-    atomic_write_text(PAIR_FILE, "".join(f"{item}\n" for item in dict.fromkeys(known)))
-    copy_atomic(USB_BLOCKLIST, BLOCKLIST_FILE)
-
+def install_files(runtime: Path, current_hash: str, upgrade: bool) -> list[str] | None:
     new_recovery_words_for_partner = None
-    if not RECOVERY_FILE.exists():
-        new_recovery_words_for_partner = new_recovery_words()
-        write_recovery(new_recovery_words_for_partner)
+    # Hold the watchdog lock while files change, so no watchdog runs a half-replaced copy.
+    lock = ws.stop_watchdog()
+    try:
+        if upgrade:
+            unlock_installed()  # lift the old copy's blocks before replacing it
 
-    copy_atomic(USB_DIR / "emergency_launcher.pyw", EMERGENCY_LAUNCHER)
-    command = f'@echo off\r\nstart "" "{pythonw_executable()}" -B "{EMERGENCY_LAUNCHER}" "{APP_DIR / "chainlink.py"}"\r\n'
-    atomic_write_text(EMERGENCY_COMMAND, command)
+        for name in INSTALL_FILES:
+            copy_atomic(USB_DIR / name, ws.app_file(name))
+        ws.capture_baseline()
+        if ws.read_baseline() is None:
+            raise RuntimeError("could not save existing browser policy; installation stopped")
 
-    create_task(runtime, APP_DIR / "watchdog.py")
+        known = sorted(ws.paired_hashes() | {current_hash})
+        atomic_write_text(ws.app_file("pair.txt"), "".join(f"{item}\n" for item in known))
+        copy_atomic(USB_BLOCKLIST, ws.app_file("blocklist.txt"))
+        read_blocklist(ws.app_file("blocklist.txt"))
+
+        if not recovery_file().exists():
+            new_recovery_words_for_partner = new_recovery_words()
+            write_recovery(new_recovery_words_for_partner)
+
+        # Start menu entry for emergency uninstall. The launcher is readable by everyone and only
+        # asks for elevation; the program it starts stays in the protected folder.
+        copy_atomic(USB_DIR / "emergency_launcher.pyw", EMERGENCY_LAUNCHER)
+        flags = " ".join(PYTHON_FLAGS)
+        command = f'@echo off\r\nstart "" "{pythonw_executable()}" {flags} "{EMERGENCY_LAUNCHER}" "{ws.app_file("chainlink.py")}"\r\n'
+        atomic_write_text(EMERGENCY_COMMAND, command)
+    finally:
+        if lock is not None:
+            lock.close()
+
+    ws.create_task(runtime, ws.app_file("watchdog.py"))
     for obsolete in ("Chainlink.ps1", "Chainlink.Common.psm1", "watchdog.ps1"):
-        (APP_DIR / obsolete).unlink(missing_ok=True)
-
+        ws.app_file(obsolete).unlink(missing_ok=True)
     return new_recovery_words_for_partner
 
 
-def re_full_hash(value: str) -> bool:
-    return len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value)
-
-
 def uninstall_chainlink() -> None:
-    stop_task()
-    time.sleep(0.75)
-    remove_lock()
-    delete_task()
+    # Order matters. First make sure no watchdog is running and none can start (the task fires
+    # every minute and would re-apply the blocks behind our back), then lift the blocks, and
+    # only then delete the files.
+    lock = ws.stop_watchdog()
+    try:
+        ws.delete_task()
+        unlock_installed()
+    finally:
+        if lock is not None:
+            lock.close()
     EMERGENCY_COMMAND.unlink(missing_ok=True)
     EMERGENCY_LAUNCHER.unlink(missing_ok=True)
-    if APP_DIR.exists():
-        if is_reparse_point(APP_DIR):
+    app_dir = ws.APP_DIR
+    if app_dir.exists():
+        if ws.is_reparse_point(app_dir):
             raise RuntimeError("refusing to remove a reparse-point program directory")
-        shutil.rmtree(APP_DIR)
+        shutil.rmtree(app_dir)
 
 
-def blocklist_for_ui() -> tuple[list[str], list[str], bool]:
+def blocklist_for_ui() -> tuple[list[str], list[str], bool, list[str]]:
+    """Websites, channels, the Shorts switch, and any lines that are not valid.
+
+    A line that is not valid is shown as written so it can be fixed; it is never dropped.
+    """
     sites: list[str] = []
     channels: list[str] = []
+    invalid: list[str] = []
     shorts = False
-    for entry in read_blocklist(USB_BLOCKLIST):
+    try:
+        lines = USB_BLOCKLIST.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            entry = normalize_entry(line)
+        except ValidationError:
+            sites.append(line)
+            invalid.append(line)
+            continue
         if entry.lower() == SHORTS_ENTRY:
             shorts = True
         elif entry.startswith(("youtube.com/@", "youtube.com/channel/", "youtube.com/c/", "youtube.com/user/")):
             channels.append(entry.removeprefix("youtube.com/"))
-        else:
+        elif entry not in sites:
             sites.append(entry)
-    return sites, channels, shorts
+    return sites, channels, shorts, invalid
 
 
 def save_blocklist(sites: list[str], channels: list[str], shorts: bool) -> None:
@@ -273,21 +311,33 @@ def show_recovery_words(parent: tk.Misc, words: list[str]) -> None:
     ttk.Label(dialog, text="They are the only emergency-uninstall phrase for this PC. They will not be shown again.", wraplength=480).grid(row=1, column=0, columnspan=2, padx=20, pady=(0, 12))
     for index, word in enumerate(words):
         ttk.Label(dialog, text=f"{index + 1}.  {word}", font=("Segoe UI", 13, "bold"), width=20).grid(row=2 + index // 2, column=index % 2, padx=8, pady=5)
+
+    def copy_words() -> None:
+        dialog.clipboard_clear()
+        dialog.clipboard_append(" ".join(words))
+        copy.configure(text="Copied!")
+
+    copy = ttk.Button(dialog, text="Copy words", command=copy_words)
+    copy.grid(row=5, column=0, columnspan=2, pady=(12, 0))
     confirmed = tk.BooleanVar()
     checkbox = ttk.Checkbutton(dialog, text="My accountability partner has these words.", variable=confirmed)
-    checkbox.grid(row=5, column=0, columnspan=2, padx=20, pady=(14, 6))
+    checkbox.grid(row=6, column=0, columnspan=2, padx=20, pady=(14, 6))
     done = ttk.Button(dialog, text="Done", command=dialog.destroy, state="disabled")
-    done.grid(row=6, column=0, columnspan=2, pady=(0, 20))
+    done.grid(row=7, column=0, columnspan=2, pady=(0, 20))
     confirmed.trace_add("write", lambda *_: done.configure(state="normal" if confirmed.get() else "disabled"))
-    dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+    dialog.protocol("WM_DELETE_WINDOW", lambda: None)  # must use the button, so the words can't be skipped by accident
     parent.wait_window(dialog)
+    try:
+        parent.clipboard_clear()  # don't leave the words on the clipboard
+    except tk.TclError:
+        pass
 
 
 def emergency_ui() -> int:
     root = tk.Tk()
     root.title("Chainlink - emergency uninstall")
     root.resizable(False, False)
-    if not RECOVERY_FILE.is_file():
+    if not recovery_file().is_file():
         messagebox.showwarning("Chainlink", "This installation has no recovery words. Repair it using the paired USB first.", parent=root)
         root.destroy()
         return 1
@@ -310,11 +360,11 @@ def emergency_ui() -> int:
         if any(not word for word in words):
             status.configure(text="Please fill in all six words.")
             return
-        if not verify_recovery_record(RECOVERY_FILE.read_text(encoding="utf-8-sig"), words):
+        if not verify_recovery_record(recovery_file().read_text(encoding="utf-8-sig"), words):
             register_recovery_failure()
             status.configure(text="Those words do not match. Check spelling and order.")
             return
-        RECOVERY_ATTEMPTS.unlink(missing_ok=True)
+        recovery_attempts_file().unlink(missing_ok=True)
         if not messagebox.askyesno("Chainlink", "Recovery words accepted. Remove Chainlink from this PC?", parent=root):
             return
         try:
@@ -358,20 +408,43 @@ class ChainlinkApp:
         self.uninstall_button.pack(side="left", padx=6)
         self.words_button = ttk.Button(buttons, text="New recovery words", command=self.new_words)
         self.words_button.pack(side="left", padx=6)
-        self.load()
+        self.saved = ""
+        invalid = self.load()
         self.update_status()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        if invalid:
+            shown = "\n".join(invalid[:10])
+            self.root.after(200, lambda: messagebox.showwarning(
+                "Chainlink",
+                "blocklist.txt has lines Chainlink cannot use. They are shown as written in the website box; "
+                "fix or delete them, then save. Until then this PC keeps using the last good list.\n\n" + shown,
+                parent=self.root,
+            ))
 
     @staticmethod
     def lines(widget: tk.Text) -> list[str]:
         return [line.strip() for line in widget.get("1.0", "end").splitlines() if line.strip()]
 
-    def load(self) -> None:
-        sites, channels, shorts = blocklist_for_ui()
+    def snapshot(self) -> str:
+        return "\n".join(self.lines(self.sites)) + "|" + "\n".join(self.lines(self.channels)) + "|" + str(self.shorts.get())
+
+    def load(self) -> list[str]:
+        sites, channels, shorts, invalid = blocklist_for_ui()
         self.sites.delete("1.0", "end")
         self.sites.insert("1.0", "\n".join(sites))
         self.channels.delete("1.0", "end")
         self.channels.insert("1.0", "\n".join(channels))
         self.shorts.set(shorts)
+        self.saved = self.snapshot()
+        return invalid
+
+    def close(self) -> None:
+        # Offer to save unsaved edits when closing.
+        if self.snapshot() != self.saved:
+            answer = messagebox.askyesnocancel("Chainlink", "Save your blocklist changes before closing?", parent=self.root)
+            if answer is None or (answer and not self.save(announce=False)):
+                return
+        self.root.destroy()
 
     def save(self, announce: bool = True) -> bool:
         try:
@@ -385,7 +458,7 @@ class ChainlinkApp:
             return False
 
     def update_status(self) -> None:
-        installed = genuine_task() or (APP_DIR / "watchdog.py").is_file()
+        installed = ws.genuine_task() or any(ws.app_file(name).is_file() for name in ("watchdog.py", "watchdog.ps1"))
         if not installed:
             self.status.configure(text='This PC is not linked. Click "Link this PC" to start.')
             self.link_button.configure(text="Link this PC", state="normal")
@@ -425,10 +498,14 @@ class ChainlinkApp:
             messagebox.showerror("Chainlink", f"Uninstall failed:\n{error}", parent=self.root)
 
     def new_words(self) -> None:
-        if not messagebox.askyesno("Chainlink", "Replace the current recovery words?", parent=self.root):
+        if not messagebox.askyesno("Chainlink", "Make new recovery words for this PC? The old words will stop working, so your partner will need the new ones.", parent=self.root):
             return
-        words = new_recovery_words()
-        write_recovery(words)
+        try:
+            words = new_recovery_words()
+            write_recovery(words)
+        except Exception as error:
+            messagebox.showerror("Chainlink", f"Could not make new recovery words:\n{error}", parent=self.root)
+            return
         show_recovery_words(self.root, words)
 
     def run(self) -> None:
@@ -439,8 +516,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Chainlink settings")
     parser.add_argument("--emergency", action="store_true")
     arguments = parser.parse_args()
-    if not is_admin():
-        relaunch_elevated(["-B", str(Path(__file__).resolve()), *( ["--emergency"] if arguments.emergency else [] )])
+    if not ws.is_admin():
+        ws.relaunch_elevated([*PYTHON_FLAGS, str(Path(__file__).resolve()), *(["--emergency"] if arguments.emergency else [])])
         return 0
     if arguments.emergency:
         return emergency_ui()

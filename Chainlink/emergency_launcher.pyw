@@ -10,7 +10,7 @@ import sys
 def main() -> None:
     if len(sys.argv) != 2:
         return
-    arguments = subprocess.list2cmdline(["-B", sys.argv[1], "--emergency"])
+    arguments = subprocess.list2cmdline(["-I", "-B", sys.argv[1], "--emergency"])
     ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, arguments, None, 0)
 
 

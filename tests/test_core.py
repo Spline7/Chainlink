@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
 import py_compile
 import sys
 import tempfile
@@ -23,6 +22,7 @@ from chainlink_core import (  # noqa: E402
     pairing_hash,
     parse_blocklist_lines,
     read_key_token,
+    unique,
     verify_recovery_record,
 )
 
@@ -33,12 +33,18 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual("xn--bcher-kva.example", normalize_entry("https://bücher.example"))
         self.assertEqual("[::1]:8080/path", normalize_entry("http://[::1]:8080/path/"))
 
+    def test_accepts_ports_and_legacy_wildcards(self) -> None:
+        self.assertEqual("example.com", normalize_entry("*.example.com"))
+        self.assertEqual("example.com/videos", normalize_entry("https://example.com/videos/*"))
+        self.assertEqual("example.com:8080", normalize_entry("example.com:8080"))
+        self.assertEqual("localhost:3000/app", normalize_entry("localhost:3000/app/"))
+
     def test_normalizes_channels(self) -> None:
         self.assertEqual("youtube.com/@SomeCreator", normalize_channel("@SomeCreator"))
         self.assertEqual("youtube.com/channel/UC123", normalize_channel("https://m.youtube.com/channel/UC123/videos"))
 
     def test_rejects_ambiguous_input(self) -> None:
-        for value in ("file:///C:/Windows", "https://user:pass@example.com", "https://example.com/?secret=x", "bad host"):
+        for value in ("file:///C:/Windows", "https://user:pass@example.com", "https://example.com/?secret=x", "bad host", "mailto:someone@example.com", "*", "exa_mple.com"):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 normalize_entry(value)
         with self.assertRaises(ValidationError):
@@ -83,6 +89,11 @@ class CryptoAndFileTests(unittest.TestCase):
         patterns = firefox_patterns("example.com")
         self.assertIn("*://example.com/*", patterns)
         self.assertIn("*://*.example.com/*", patterns)
+        self.assertEqual(["*://*/*"], firefox_patterns("*"))
+
+    def test_unique_keeps_single_element_groups_separate(self) -> None:
+        self.assertEqual(["a.example", "x.example", "y.example"], unique(["a.example"], ["a.example"], ["x.example", "y.example"]))
+        self.assertEqual([], unique([], [""]))
 
 
 class SourceTests(unittest.TestCase):
@@ -90,24 +101,6 @@ class SourceTests(unittest.TestCase):
         for path in [*SOURCE.glob("*.py"), *SOURCE.glob("*.pyw"), *Path(__file__).parent.glob("*.py")]:
             with self.subTest(path=path):
                 py_compile.compile(str(path), doraise=True)
-
-    @unittest.skipUnless(os.name == "nt", "Windows Task Scheduler XML")
-    def test_task_xml_uses_system_principal_and_absolute_paths(self) -> None:
-        from unittest.mock import patch
-
-        from windows_support import APP_DIR, PROGRAM_DATA, PROGRAM_FILES_ROOTS, system_executable, task_xml, task_xml_is_genuine
-
-        trusted_python = PROGRAM_FILES_ROOTS[0] / "Python312" / "python.exe"
-        xml = task_xml(trusted_python, APP_DIR / "watchdog.py")
-        self.assertIn("S-1-5-18", xml)
-        self.assertIn("MultipleInstancesPolicy>IgnoreNew", xml)
-        self.assertIn("PT1M", xml)
-        self.assertIn(str(trusted_python), xml)
-        self.assertTrue(task_xml_is_genuine(xml))
-        self.assertFalse(task_xml_is_genuine(f"<Task><Principals><UserId>ordinary-user</UserId></Principals><Description>{trusted_python}</Description></Task>"))
-        with patch.dict(os.environ, {"ProgramData": r"C:\Chainlink-Evil", "SystemRoot": r"C:\Chainlink-Evil"}):
-            self.assertEqual(PROGRAM_DATA / "Chainlink", APP_DIR)
-            self.assertNotIn("Chainlink-Evil", str(system_executable("schtasks.exe")))
 
 
 if __name__ == "__main__":

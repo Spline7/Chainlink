@@ -54,10 +54,20 @@ def normalize_entry(value: str) -> str:
     if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
         raise ValidationError("entries cannot contain whitespace or control characters")
 
-    scheme_match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):", value)
-    if scheme_match and scheme_match.group(1).lower() not in {"http", "https"}:
+    # "example.com:8080" is a host and port; "mailto:someone" or "file:///C:/" is another scheme.
+    scheme_match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", value)
+    if scheme_match:
+        if scheme_match.group(1).lower() not in {"http", "https"}:
+            raise ValidationError("only http:// and https:// URLs are supported")
+    elif re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value) and not re.match(r"^[^:/]+:[0-9]{1,5}(/|$)", value):
         raise ValidationError("only http:// and https:// URLs are supported")
-    candidate = value if "://" in value else f"https://{value}"
+
+    # The original release accepted "*.example.com" and "example.com/*"; both mean the plain entry.
+    scheme, rest = (scheme_match.group(0), value[scheme_match.end():]) if scheme_match else ("https://", value)
+    rest = re.sub(r"[/*]+$", "", re.sub(r"^\*\.", "", rest))
+    if not rest:
+        raise ValidationError("invalid website or URL")
+    candidate = scheme + rest
     try:
         parsed = urlsplit(candidate)
         port = parsed.port
@@ -127,23 +137,33 @@ def parse_blocklist_lines(lines: list[str] | tuple[str, ...] | object) -> list[s
     return entries
 
 
+def parse_blocklist_bytes(data: bytes) -> list[str]:
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise ValidationError("the blocklist is not UTF-8 text") from error
+    return parse_blocklist_lines(text.splitlines())
+
+
 def read_blocklist(path: Path) -> list[str]:
-    with path.open("r", encoding="utf-8-sig", errors="strict") as source:
-        return parse_blocklist_lines(source)
+    return parse_blocklist_bytes(path.read_bytes())
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=False, exist_ok=True)
+def atomic_write_bytes(path: Path, data: bytes) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=".chainlink-", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
-            output.write(text)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def read_key_token(path: Path) -> str:
@@ -210,6 +230,8 @@ def verify_recovery_record(record: str, words: list[str] | tuple[str, ...]) -> b
 
 
 def firefox_patterns(entry: str) -> list[str]:
+    if entry == "*":  # the watchdog's block-everything fail-safe
+        return ["*://*/*"]
     if "/" not in entry:
         return [f"*://{entry}/*", f"*://*.{entry}/*"]
     host, path = entry.split("/", 1)
@@ -224,5 +246,6 @@ def firefox_patterns(entry: str) -> list[str]:
     ]
 
 
-def unique(values: object) -> list[str]:
-    return list(dict.fromkeys(str(value) for value in values if str(value)))  # type: ignore[union-attr]
+def unique(*groups: object) -> list[str]:
+    """Ordered union of any number of string collections, without empty strings."""
+    return list(dict.fromkeys(str(value) for group in groups for value in group if str(value)))  # type: ignore[union-attr]

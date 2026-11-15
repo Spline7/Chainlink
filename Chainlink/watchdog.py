@@ -1,23 +1,29 @@
-"""Chainlink background watchdog. This file is installed and run as SYSTEM."""
+"""Chainlink background watchdog. This file is installed and run as SYSTEM.
+
+Every 5 seconds it looks for the paired Chainlink USB key:
+  - key NOT found -> browser blocks are ON
+  - key found     -> browser blocks are OFF, and the blocklist is synced from the USB
+It makes no network requests and sends no telemetry.
+"""
 
 from __future__ import annotations
 
 import argparse
-import ctypes
-import os
+import sys
 import time
+from pathlib import Path
 
-from windows_support import (
-    PID_FILE,
+# The task runs Python in isolated mode, which does not add this folder to the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from windows_support import (  # noqa: E402
+    APP_DIR,
+    Watchdog,
+    app_file,
     capture_baseline,
-    find_key,
-    lock_intact,
     log,
+    open_watchdog_lock,
     remove_lock,
-    set_lock,
-    set_status,
-    sync_blocklist,
-    validate_usb_blocklist,
 )
 
 
@@ -36,49 +42,19 @@ def main() -> int:
         log("Chainlink browser policies removed and prior policies restored.")
         return 0
 
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "Global\\ChainlinkWatchdog")
-    if not mutex:
-        raise ctypes.WinError()
-    if ctypes.windll.kernel32.GetLastError() == 183:
-        log("A watchdog instance is already running; exiting duplicate.")
-        ctypes.windll.kernel32.CloseHandle(mutex)
+    if not APP_DIR.is_dir():  # uninstalled
         return 0
-
+    lock = open_watchdog_lock(app_file("watchdog.lock"))
+    if lock is None:  # another watchdog, or an install or uninstall, holds the lock
+        return 0
     try:
-        PID_FILE.write_text(str(os.getpid()), encoding="ascii")
         log("Watchdog started.")
-        state = ""
-        tick = 0
+        watchdog = Watchdog()
         while True:
-            try:
-                usb = find_key()
-                if usb:
-                    validate_usb_blocklist(usb)
-                    if state != "unlocked":
-                        remove_lock()
-                        state = "unlocked"
-                        set_status(f"UNLOCKED - key found on {usb}")
-                        log(f"Key found on {usb} - blocks lifted.")
-                    sync_blocklist(usb)
-                elif state != "locked" or (tick % 12 == 0 and not lock_intact()):
-                    set_lock()
-                    log("Blocks were changed outside Chainlink - re-applied." if state == "locked" else "Key not present - blocks applied.")
-                    state = "locked"
-                    set_status("LOCKED - key not present")
-            except Exception as error:  # keep a SYSTEM watchdog alive and fail closed
-                log(f"Watchdog cycle failed: {error}")
-                try:
-                    set_lock()
-                    state = "locked"
-                    set_status("LOCKED - fail-safe after an error")
-                except Exception as fail_safe_error:
-                    log(f"Fail-safe lock also failed: {fail_safe_error}")
-            tick += 1
+            watchdog.cycle()
             time.sleep(5)
     finally:
-        PID_FILE.unlink(missing_ok=True)
-        ctypes.windll.kernel32.ReleaseMutex(mutex)
-        ctypes.windll.kernel32.CloseHandle(mutex)
+        lock.close()
 
 
 if __name__ == "__main__":

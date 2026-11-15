@@ -57,6 +57,15 @@ $validTask.Principal.UserId = 'SYSTEM'
 $validTask.Actions[0].Arguments += ' -Command malicious'
 Assert-True (-not (Test-ChainlinkScheduledTaskObject $validTask $powershellPath $watchdogPath)) 'rejects altered watchdog action'
 
+$originalProgramData = $env:ProgramData
+try {
+    $env:ProgramData = 'C:\Chainlink-Evil'
+    $trustedProgramData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    Assert-True ($trustedProgramData -ne $env:ProgramData) 'ignores spoofed ProgramData environment variable'
+} finally {
+    $env:ProgramData = $originalProgramData
+}
+
 $tempDirectory = Join-Path ([IO.Path]::GetTempPath()) ('chainlink-tests-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempDirectory | Out-Null
 try {

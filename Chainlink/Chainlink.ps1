@@ -8,13 +8,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PowerShellExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
 # Ask for admin rights if we don't have them yet (e.g. when started from the Start menu shortcut).
 $me = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $relaunch = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
     if ($Emergency) { $relaunch += ' -Emergency' }
-    try { Start-Process (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -WindowStyle Hidden -ArgumentList $relaunch } catch {}
+    try { Start-Process $PowerShellExe -Verb RunAs -WindowStyle Hidden -ArgumentList $relaunch } catch {}
     exit
 }
 
@@ -22,17 +23,18 @@ $UsbDir        = $PSScriptRoot                                  # e.g. D:\Chainl
 $UsbRoot       = (Split-Path -Path $UsbDir -Qualifier) + '\'    # e.g. D:\
 $KeyFile       = Join-Path $UsbDir 'chainlink.key'
 $BlocklistPath = Join-Path $UsbDir 'blocklist.txt'
-$AppDir        = Join-Path $env:ProgramData 'Chainlink'
+$ProgramData   = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+if ([string]::IsNullOrWhiteSpace($ProgramData)) { throw 'Windows did not provide the ProgramData directory.' }
+$AppDir        = Join-Path $ProgramData 'Chainlink'
 $PairFile      = Join-Path $AppDir 'pair.txt'
 $TaskName      = 'Chainlink'
 $TaskPath      = '\'
 $ShortsEntry   = 'youtube.com/shorts'
 $RecoveryFile  = Join-Path $AppDir 'recovery.txt'
 $RecoveryAttemptsFile = Join-Path $AppDir 'recovery-attempts.txt'
-$ShortcutPath  = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Chainlink Emergency Uninstall.lnk'
+$ShortcutPath  = Join-Path $ProgramData 'Microsoft\Windows\Start Menu\Programs\Chainlink Emergency Uninstall.lnk'
 $WordCount     = 6
 $CommonModule  = Join-Path $PSScriptRoot 'Chainlink.Common.psm1'
-$PowerShellExe = Join-Path $PSHOME 'powershell.exe'
 Import-Module $CommonModule -Force
 
 # Recovery words are picked from this list.

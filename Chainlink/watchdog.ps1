@@ -8,7 +8,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$AppDir        = Join-Path $env:ProgramData 'Chainlink'
+$ProgramData   = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+if ([string]::IsNullOrWhiteSpace($ProgramData)) { throw 'Windows did not provide the ProgramData directory.' }
+$AppDir        = Join-Path $ProgramData 'Chainlink'
 $PairFile      = Join-Path $AppDir 'pair.txt'
 $BlocklistFile = Join-Path $AppDir 'blocklist.txt'
 $BaselineFile  = Join-Path $AppDir 'policy-baseline.json'

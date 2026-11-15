@@ -7,7 +7,9 @@ Chainlink is a small, open-source website blocker for Windows 10 and 11 that use
 
 It's meant to add friction, not to be unbreakable. If you lose the USB, your accountability partner's recovery words let you uninstall it. Someone with admin rights and technical know-how could still remove it by hand.
 
-**Privacy:** Chainlink makes no network requests and has no telemetry, accounts, or cloud services. It is plain-text PowerShell that you can read in Notepad.
+**Privacy:** Chainlink makes no network requests and has no telemetry, accounts, or cloud services. It is standard-library Python that you can inspect in any text editor.
+
+**Requirement:** install Python 3.10 or newer for all users on each Windows PC. A system-wide python.org installation is recommended because the background watchdog runs as the Windows SYSTEM account.
 
 ---
 
@@ -16,9 +18,11 @@ It's meant to add friction, not to be unbreakable. If you lose the USB, your acc
 ```
 Chainlink.cmd            <- double-click this
 Chainlink\
-    Chainlink.ps1        the Chainlink window: edit blocklist / link / uninstall
-    Chainlink.Common.psm1 shared validation and cryptographic helpers
-    watchdog.ps1         background checker (copied to the PC when you link it)
+    chainlink.py          settings, install, recovery, and uninstall window
+    chainlink_core.py     validation and cryptographic helpers
+    windows_support.py    registry, drive, ACL, and Task Scheduler integration
+    watchdog.py           background checker (copied to the PC when you link it)
+    emergency_launcher.pyw elevates before opening protected recovery code
     blocklist.txt        the sites you want blocked
     chainlink.key        your secret key (created on first link, hidden, never share it)
 ```
@@ -86,13 +90,12 @@ If your partner loses the words, plug in your USB, open Chainlink, and click **N
 ## How it works
 
 - **Linking** creates a random secret (`chainlink.key`) on the USB. The PC stores only a SHA-256 hash of that secret combined with the USB's volume serial number, so copying the key file to a different drive doesn't work.
-- A **scheduled task** named `Chainlink` runs `C:\ProgramData\Chainlink\watchdog.ps1` as SYSTEM. It starts at boot, and Task Scheduler restarts it within a minute if it's stopped.
+- A **scheduled task** named `Chainlink` runs `C:\ProgramData\Chainlink\watchdog.py` as SYSTEM. It starts at boot, retries failures, and starts again within a minute if it is stopped.
 - Every **5 seconds** the watchdog checks the connected drives for a valid key:
   - **Not found:** it writes the blocklist into the browsers' policy settings in the registry (`URLBlocklist` for Chrome/Edge/Brave, `WebsiteFilter` for Firefox). It also turns off Incognito/InPrivate, guest mode, and adding profiles. About once a minute it checks whether those settings were changed and puts them back.
   - **Found:** it removes those settings and copies `blocklist.txt` from the USB if the file changed.
-- Only SYSTEM and Administrators can modify `C:\ProgramData\Chainlink`.
-- **Recovery words** are 6 words picked at random from a built-in list of 256. The PC stores only a salted, slow hash of them (PBKDF2, 100,000 rounds), never the words themselves.
-- New installations use 300,000 PBKDF2 rounds and a versioned recovery record. Existing 100,000-round records remain usable until you choose **New recovery words**.
+- Only SYSTEM and Administrators can read or modify `C:\ProgramData\Chainlink`; the public emergency launcher elevates before reading installed code.
+- **Recovery words** are 6 words picked at random from a built-in list of 256. New records use salted PBKDF2-HMAC-SHA256 with 300,000 rounds. Existing PowerShell records remain usable until you choose **New recovery words**.
 - Invalid key files, unreadable state, and watchdog-cycle errors fail closed: Chainlink tries to apply the blocklist and records the error in `C:\ProgramData\Chainlink\log.txt`.
 
 ## Update or repair an installation
@@ -108,13 +111,13 @@ Run `Chainlink.cmd` from the paired USB and click **Repair / update this PC**. T
 
 ## Development
 
-The production scripts support Windows PowerShell 5.1 (the version included with Windows 10 and 11). Run the dependency-free checks from a PowerShell prompt:
+The runtime has no third-party packages. Run the dependency-free checks with Python 3.10 or newer:
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\PowerShell.Tests.ps1
+```console
+python -m unittest discover -s tests -v
 ```
 
-The tests parse every PowerShell file and exercise URL/channel normalization, rejection cases, hashing, constant-time comparison, atomic writes, and blocklist limits/deduplication. See [SECURITY.md](SECURITY.md) for the threat model and responsible-reporting guidance.
+The tests compile every Python file and exercise URL/channel normalization, rejection cases, legacy recovery compatibility, atomic writes, task XML, and blocklist limits/deduplication. See [SECURITY.md](SECURITY.md) for the threat model and responsible-reporting guidance.
 
 ## License
 

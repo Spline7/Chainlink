@@ -9,7 +9,7 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parents[1] / "Chainlink"
 sys.path.insert(0, str(SOURCE))
 
-from windows_support import secure_app_directory, task_xml, volume_serial  # noqa: E402
+from windows_support import APP_DIR, secure_app_directory, task_xml, volume_serial  # noqa: E402
 
 
 def main() -> int:
@@ -30,7 +30,7 @@ def main() -> int:
         arguments.path.mkdir(exist_ok=False)
         secure_app_directory(arguments.path)
         return 0
-    generated = task_xml(Path(sys.executable), Path(r"C:\ProgramData\Chainlink\watchdog.py"))
+    generated = task_xml(Path(sys.executable), APP_DIR / "watchdog.py")
     generated = generated.replace("<Settings>", "<Settings><Enabled>false</Enabled>")
     arguments.output.write_text(generated, encoding="utf-16")
     return 0

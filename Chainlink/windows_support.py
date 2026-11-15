@@ -5,9 +5,12 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import xml.sax.saxutils
+import xml.etree.ElementTree as element_tree
+import uuid
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +30,49 @@ if os.name != "nt":  # pragma: no cover - imported only on Windows in production
 
 import winreg  # noqa: E402
 
-APP_DIR = Path(os.environ["ProgramData"]) / "Chainlink"
+
+class _Guid(ctypes.Structure):
+    _fields_ = [
+        ("data1", wintypes.DWORD),
+        ("data2", wintypes.WORD),
+        ("data3", wintypes.WORD),
+        ("data4", ctypes.c_ubyte * 8),
+    ]
+
+
+def known_folder(identifier: str) -> Path:
+    guid = _Guid.from_buffer_copy(uuid.UUID(identifier).bytes_le)
+    raw = ctypes.c_void_p()
+    function = ctypes.windll.shell32.SHGetKnownFolderPath
+    function.argtypes = [ctypes.POINTER(_Guid), wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    function.restype = ctypes.c_long
+    result = function(ctypes.byref(guid), 0, None, ctypes.byref(raw))
+    try:
+        if result != 0 or not raw.value:
+            raise OSError(f"SHGetKnownFolderPath failed with HRESULT 0x{result & 0xFFFFFFFF:08X}")
+        return Path(ctypes.wstring_at(raw.value))
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(raw)
+
+
+PROGRAM_DATA = known_folder("62ab5d82-fdc1-4dc3-a9dd-070d1d495d97")
+def _program_files_roots() -> tuple[Path, ...]:
+    roots = []
+    for identifier in (
+        "905e63b6-c1bf-494e-b29c-65b732d3d21a",
+        "7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e",
+    ):
+        try:
+            roots.append(known_folder(identifier).resolve())
+        except OSError:
+            continue
+    if not roots:
+        raise OSError("Windows did not provide a trusted Program Files directory")
+    return tuple(dict.fromkeys(roots))
+
+
+PROGRAM_FILES_ROOTS = _program_files_roots()
+APP_DIR = PROGRAM_DATA / "Chainlink"
 PAIR_FILE = APP_DIR / "pair.txt"
 BLOCKLIST_FILE = APP_DIR / "blocklist.txt"
 BASELINE_FILE = APP_DIR / "policy-baseline.json"
@@ -46,7 +91,14 @@ FIREFOX = r"SOFTWARE\Policies\Mozilla\Firefox"
 
 
 def system_executable(name: str) -> Path:
-    return Path(os.environ["SystemRoot"]) / "System32" / name
+    buffer = ctypes.create_unicode_buffer(32768)
+    function = ctypes.windll.kernel32.GetWindowsDirectoryW
+    function.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    function.restype = wintypes.UINT
+    length = function(buffer, len(buffer))
+    if not length or length >= len(buffer):
+        raise ctypes.WinError()
+    return Path(buffer.value) / "System32" / name
 
 
 def run_checked(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -413,7 +465,43 @@ def query_task_xml() -> str | None:
 
 def genuine_task() -> bool:
     xml = query_task_xml()
-    return bool(xml and any(str(APP_DIR / name).lower() in xml.lower() for name in ("watchdog.py", "watchdog.ps1")))
+    return bool(xml and task_xml_is_genuine(xml))
+
+
+def task_xml_is_genuine(xml: str) -> bool:
+    try:
+        root = element_tree.fromstring(xml)
+    except element_tree.ParseError:
+        return False
+    user_ids = {str(node.text or "").strip().upper() for node in root.findall(".//{*}UserId")}
+    if not user_ids.intersection({"SYSTEM", "S-1-5-18"}):
+        return False
+
+    expected_watchdog = APP_DIR / "watchdog.py"
+    expected_arguments = subprocess.list2cmdline(["-B", str(expected_watchdog)])
+    python_name = re.compile(r"python(?:3(?:\.\d+)?)?\.exe", re.IGNORECASE)
+    for action in root.findall(".//{*}Exec"):
+        command = str(action.findtext("{*}Command") or "").strip()
+        arguments = str(action.findtext("{*}Arguments") or "").strip()
+        command_path = Path(command)
+        if (
+            command_path.is_absolute()
+            and python_name.fullmatch(command_path.name)
+            and any(command_path.resolve().is_relative_to(root_path) for root_path in PROGRAM_FILES_ROOTS)
+            and arguments.lower() == expected_arguments.lower()
+        ):
+            return True
+
+        powershell = system_executable(r"WindowsPowerShell\v1.0\powershell.exe")
+        powershell_arguments = {
+            f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{APP_DIR / "watchdog.ps1"}"',
+            f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{APP_DIR / "watchdog.ps1"}"',
+        }
+        if command.lower() == str(powershell).lower() and arguments.lower() in {
+            value.lower() for value in powershell_arguments
+        }:
+            return True
+    return False
 
 
 def create_task(python_executable: Path, watchdog: Path) -> None:

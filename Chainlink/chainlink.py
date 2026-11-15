@@ -33,6 +33,8 @@ from windows_support import (
     BASELINE_FILE,
     BLOCKLIST_FILE,
     PAIR_FILE,
+    PROGRAM_DATA,
+    PROGRAM_FILES_ROOTS,
     capture_baseline,
     create_task,
     delete_task,
@@ -54,7 +56,7 @@ KEY_FILE = USB_DIR / "chainlink.key"
 USB_BLOCKLIST = USB_DIR / "blocklist.txt"
 RECOVERY_FILE = APP_DIR / "recovery.txt"
 RECOVERY_ATTEMPTS = APP_DIR / "recovery-attempts.json"
-START_MENU = Path(os.environ["ProgramData"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+START_MENU = PROGRAM_DATA / "Microsoft" / "Windows" / "Start Menu" / "Programs"
 EMERGENCY_COMMAND = START_MENU / "Chainlink Emergency Uninstall.cmd"
 EMERGENCY_LAUNCHER = START_MENU / "Chainlink Emergency Uninstall.pyw"
 INSTALL_FILES = ("chainlink.py", "chainlink_core.py", "windows_support.py", "watchdog.py")
@@ -69,10 +71,18 @@ def validated_runtime() -> Path:
     executable = Path(sys.executable).resolve()
     if not executable.is_file() or executable.suffix.lower() != ".exe":
         raise RuntimeError("Chainlink requires a normal Windows Python executable")
-    trusted_roots = [Path(value).resolve() for name in ("ProgramFiles", "ProgramFiles(x86)") if (value := os.environ.get(name))]
-    if not any(executable.is_relative_to(root) for root in trusted_roots):
+    if not re_python_executable(executable.name) or not any(executable.is_relative_to(root) for root in PROGRAM_FILES_ROOTS):
         raise RuntimeError("the SYSTEM background task requires Python under Program Files; install Python 3.10+ for all users and run Chainlink again")
     return executable
+
+
+def re_python_executable(name: str) -> bool:
+    lower = name.lower()
+    if lower in {"python.exe", "python3.exe"}:
+        return True
+    if not lower.startswith("python3.") or not lower.endswith(".exe"):
+        return False
+    return lower[8:-4].isdigit()
 
 
 def usb_hash() -> str:
@@ -158,7 +168,9 @@ def install_chainlink() -> list[str] | None:
     secure_app_directory()
 
     stop_task()
-    if has_task and not BASELINE_FILE.exists():
+    if has_task and BASELINE_FILE.exists():
+        remove_lock()
+    elif has_task:
         old_python = APP_DIR / "watchdog.py"
         old_powershell = APP_DIR / "watchdog.ps1"
         if old_python.is_file():
@@ -186,6 +198,11 @@ def install_chainlink() -> list[str] | None:
     atomic_write_text(PAIR_FILE, "".join(f"{item}\n" for item in dict.fromkeys(known)))
     copy_atomic(USB_BLOCKLIST, BLOCKLIST_FILE)
 
+    new_recovery_words_for_partner = None
+    if not RECOVERY_FILE.exists():
+        new_recovery_words_for_partner = new_recovery_words()
+        write_recovery(new_recovery_words_for_partner)
+
     copy_atomic(USB_DIR / "emergency_launcher.pyw", EMERGENCY_LAUNCHER)
     command = f'@echo off\r\nstart "" "{pythonw_executable()}" -B "{EMERGENCY_LAUNCHER}" "{APP_DIR / "chainlink.py"}"\r\n'
     atomic_write_text(EMERGENCY_COMMAND, command)
@@ -194,11 +211,7 @@ def install_chainlink() -> list[str] | None:
     for obsolete in ("Chainlink.ps1", "Chainlink.Common.psm1", "watchdog.ps1"):
         (APP_DIR / obsolete).unlink(missing_ok=True)
 
-    if not RECOVERY_FILE.exists():
-        words = new_recovery_words()
-        write_recovery(words)
-        return words
-    return None
+    return new_recovery_words_for_partner
 
 
 def re_full_hash(value: str) -> bool:

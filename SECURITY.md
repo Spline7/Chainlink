@@ -23,11 +23,12 @@ The six recovery words contain 48 bits of random entropy. Their stored verifier 
 - A missing, malformed, or unreadable USB key never unlocks the machine.
 - With no valid key present, errors fail closed. A missing or corrupt installed blocklist blocks every URL.
 - With a valid key present, a bad `blocklist.txt` on the USB does not lock the machine. The watchdog keeps the last good list, copies the USB file before validating it so the bytes it checks are the bytes it installs, and reports the problem in `status.txt` and `log.txt`.
-- Writes to mutable state use a temporary file and rename where practical.
+- Writes to mutable state go to a temporary file that then replaces the original in one step where the file system allows it.
 - Install refuses a program directory that is a file, junction, or symbolic link, that already holds files without a genuine Chainlink task, or that is owned by another account. A new directory is created with its owner and protected ACL in a single call, so there is no window in which another account can plant files that would later run as SYSTEM.
 - A scheduled task named `Chainlink` is treated as Chainlink's only if it runs as SYSTEM and its action is exactly the installed watchdog. Uninstall also removes a same-named task whose action points into the Chainlink directory, so it never leaves a SYSTEM task aimed at a path it has just deleted.
 - The watchdog holds an exclusive lock file inside the protected directory. Install, repair, and uninstall take the same lock before changing anything, which proves no watchdog is running and keeps a new one from starting. The lock cannot be held by a non-administrator, unlike a named kernel object.
-- Uninstall removes the scheduled task before lifting the blocks, so the once-a-minute trigger cannot restart the watchdog and re-apply them.
+- Uninstall removes the scheduled task before lifting the blocks, so the once-a-minute trigger cannot restart the watchdog and re-apply them. Before it releases the lock it writes a marker; a watchdog that was already starting checks for the marker once it holds the lock and exits. A failed first-time link deletes the program folder only after its task is confirmed gone.
+- Uninstall and repair refuse to read state from, or run a script in, a program folder that a non-administrator could have written.
 - A policy baseline is captured before Chainlink applies policy, and each lock records the entries it wrote. Unlock and uninstall remove exactly those entries and merge the baseline with unrelated entries rather than deleting complete policy trees. If the baseline is unreadable, Chainlink removes only the values it manages.
 - Recovery verifiers are salted and compared without an early-exit byte comparison. Recovery words are never written to disk.
 - The per-USB key is excluded from version control.

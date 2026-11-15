@@ -56,7 +56,7 @@ Click **Save blocklist**, then leave the USB plugged in for about 10 seconds so 
 
 Entries must be ordinary HTTP or HTTPS hostnames, with an optional port and path. `*.example.com` and `example.com/*` are accepted and mean the same as `example.com`. Chainlink rejects credentials, query strings, fragments, malformed URLs, overly long entries, and blocklists above 2,048 entries instead of passing ambiguous input to browser policy.
 
-If `blocklist.txt` on the USB has a line Chainlink cannot use (for example after a typo in Notepad), your key still unlocks the PC. The PC keeps its last good list until the file is fixed, and the Chainlink window shows the bad lines so you can correct them. Firefox reads at most 1,000 patterns, and each entry takes two to six, so very long lists are only fully enforced in Chrome, Edge, and Brave.
+If `blocklist.txt` on the USB has a line Chainlink cannot use (for example after a typo in Notepad), your key still unlocks the PC. The PC keeps its last good list until the file is fixed, and the Chainlink window shows the bad lines so you can correct them. Browsers read only the first 1,000 entries of a policy list. Chrome, Edge, and Brave use one per blocklist entry and Firefox uses two to six, so keep the list well under those limits. An entry with a port (`example.com:8080`) is enforced by Chrome, Edge, and Brave; Firefox's filter has no port matching and may ignore it.
 
 The list is stored in `Chainlink\blocklist.txt` on the USB, so you can also edit it in Notepad.
 
@@ -94,8 +94,8 @@ If your partner loses the words, plug in your USB, open Chainlink, and click **N
   - **Found:** it removes those settings and copies `blocklist.txt` from the USB if the file changed.
 - Only SYSTEM and Administrators can read or modify `C:\ProgramData\Chainlink`. Chainlink creates that folder with its final owner and permissions in one step, and refuses to reuse a folder that another account created or owns, because everything in it runs as SYSTEM.
 - **Recovery words** are 6 words picked at random from a built-in list of 256. The PC stores only a salted, slow hash of them (PBKDF2, 300,000 rounds), never the words themselves. Records made by the original release (100,000 rounds) remain usable until you choose **New recovery words**.
-- Without a valid key, errors fail closed: an invalid key file, unreadable state, or a failed watchdog cycle leaves the blocks on, and a missing or damaged installed blocklist blocks every site until the key is plugged in again. Errors are recorded in `C:\ProgramData\Chainlink\log.txt`.
-- Install, repair, and uninstall hold a lock that the watchdog also needs, so the watchdog can never re-apply blocks half way through an uninstall. Uninstall removes the scheduled task first, then lifts the blocks, then deletes the files.
+- Without a valid key, errors fail closed: after an invalid key file, unreadable state, or a failed watchdog cycle the watchdog keeps trying to apply the blocks, and a missing or damaged installed blocklist blocks every site until the key is plugged in again. Errors are recorded in `C:\ProgramData\Chainlink\log.txt`.
+- Install, repair, and uninstall hold a lock that the watchdog also needs. Uninstall removes the scheduled task first, lifts the blocks, and leaves a marker that makes any watchdog that was already starting exit instead of locking again, then deletes the files.
 
 ## Update or repair an installation
 

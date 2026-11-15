@@ -14,14 +14,19 @@ Set-StrictMode -Version 2.0
 
 $ProgramData   = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 if ([string]::IsNullOrWhiteSpace($ProgramData)) { throw 'Windows did not provide the ProgramData directory.' }
-$AppDir        = Join-Path $ProgramData 'Chainlink'
-$PairFile      = Join-Path $AppDir 'pair.txt'
-$BlocklistFile = Join-Path $AppDir 'blocklist.txt'
-$AppliedFile   = Join-Path $AppDir 'applied-blocklist.txt'
-$BaselineFile  = Join-Path $AppDir 'policy-baseline.json'
-$LockFile      = Join-Path $AppDir 'watchdog.lock'
-$LogFile       = Join-Path $AppDir 'log.txt'
-$StatusFile    = Join-Path $AppDir 'status.txt'
+# Every path inside the program folder is derived here, in one place.
+function Set-AppDir([string]$path) {
+    $script:AppDir        = $path
+    $script:PairFile      = Join-Path $path 'pair.txt'
+    $script:BlocklistFile = Join-Path $path 'blocklist.txt'
+    $script:AppliedFile   = Join-Path $path 'applied-blocklist.txt'
+    $script:BaselineFile  = Join-Path $path 'policy-baseline.json'
+    $script:LockFile      = Join-Path $path 'watchdog.lock'
+    $script:UninstallMarker = Join-Path $path 'uninstalling'   # written by uninstall just before it deletes this folder
+    $script:LogFile       = Join-Path $path 'log.txt'
+    $script:StatusFile    = Join-Path $path 'status.txt'
+}
+Set-AppDir (Join-Path $ProgramData 'Chainlink')
 $KeyRelPath    = 'Chainlink\chainlink.key'
 $PolicyRoot    = 'HKLM:\SOFTWARE\Policies'
 $MaxUsbBlocklistBytes = 1MB
@@ -90,10 +95,12 @@ function Read-AppliedEntries {
 function Set-Lock {
     $list = @(Get-Blocklist)
     $previous = @(Read-AppliedEntries)
-    # Record the entries before writing them, so an interrupted lock can still be undone.
-    Set-ChainlinkTextFileAtomic -Path $AppliedFile -Lines @(Merge-ChainlinkValues $previous $list)
+    # Record the entries before writing them, so an interrupted lock can still be undone. The
+    # record is a convenience for unlock; failing to write it must never stop the lock itself.
+    try { Set-ChainlinkTextFileAtomic -Path $AppliedFile -Lines @(Merge-ChainlinkValues $previous $list) }
+    catch { Write-Log "Could not record applied entries: $($_.Exception.Message)" -Once }
     Set-ChainlinkPolicyLock -Root $PolicyRoot -Entries $list -PreviousEntries $previous -Baseline (Read-Baseline)
-    Set-ChainlinkTextFileAtomic -Path $AppliedFile -Lines $list
+    try { Set-ChainlinkTextFileAtomic -Path $AppliedFile -Lines $list } catch { }
 }
 
 function Remove-Lock {
@@ -112,6 +119,12 @@ function Get-VolumeSerial {
     if ($deviceId -notmatch '^[A-Za-z]:$') { return $null }
     $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$deviceId'" -ErrorAction Stop
     return [string]$disk.VolumeSerialNumber
+}
+
+# The watchdog runs as SYSTEM, so it must not follow a link on the USB to some other file.
+function Test-IsLink {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return [bool]((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)
 }
 
 function Read-KeyToken {
@@ -135,6 +148,7 @@ function Find-Key {
             $root = $drive.RootDirectory.FullName
             $keyPath = Join-Path $root $KeyRelPath
             if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) { continue }
+            if (Test-IsLink $keyPath) { continue }
             $token = Read-KeyToken $keyPath
             $serial = Get-VolumeSerial $root
             if ($null -eq $token -or [string]::IsNullOrWhiteSpace($serial)) { continue }
@@ -151,6 +165,7 @@ function Sync-Blocklist {
     param([Parameter(Mandatory = $true)][string]$UsbRoot)
     $source = Join-Path $UsbRoot 'Chainlink\blocklist.txt'
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { return 'the USB has no Chainlink\blocklist.txt' }
+    if (Test-IsLink $source) { return 'blocklist.txt on the USB is a link, not a file' }
     if ((Get-Item -LiteralPath $source -Force).Length -gt $MaxUsbBlocklistBytes) { return 'blocklist.txt on the USB is too large' }
 
     $installed = Test-Path -LiteralPath $BlocklistFile -PathType Leaf
@@ -162,7 +177,7 @@ function Sync-Blocklist {
         Copy-Item -LiteralPath $source -Destination $temporary -Force
         try { [void]@(Get-ChainlinkBlocklist -Path $temporary) }
         catch { return "blocklist.txt on the USB has a problem: $($_.Exception.Message)" }
-        Move-Item -LiteralPath $temporary -Destination $BlocklistFile -Force
+        Move-ChainlinkFileOver -Source $temporary -Destination $BlocklistFile
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
     }
@@ -226,8 +241,11 @@ $lock = Open-ChainlinkWatchdogLock -Path $LockFile
 if ($null -eq $lock) { exit 0 }   # another watchdog, or an install or uninstall, holds the lock
 
 try {
+    # Checked only after the lock is held: uninstall writes the marker while it holds the lock,
+    # so a watchdog that was already starting can never slip in behind it and re-apply blocks.
+    if (Test-Path -LiteralPath $UninstallMarker) { exit 0 }
     Write-Log 'Watchdog started.'
-    while ($true) {
+    while (-not (Test-Path -LiteralPath $UninstallMarker)) {
         Invoke-WatchdogCycle
         Start-Sleep -Seconds 5
     }

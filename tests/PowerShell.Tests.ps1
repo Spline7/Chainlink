@@ -16,11 +16,13 @@ function Assert-True([bool]$Value, [string]$Name) {
     if (-not $Value) { throw "$Name failed." }
 }
 
-function Assert-Throws([scriptblock]$Action, [string]$Name) {
+# $Pattern, when given, must match the error message, so an unrelated failure does not pass.
+function Assert-Throws([scriptblock]$Action, [string]$Name, [string]$Pattern = '') {
     $script:tests++
-    try { & $Action; throw "$Name failed: no exception was thrown." }
+    try { [void](& $Action); throw "$Name failed: no exception was thrown." }
     catch {
         if ($_.Exception.Message -eq "$Name failed: no exception was thrown.") { throw }
+        if ($Pattern -and $_.Exception.Message -notmatch $Pattern) { throw "$Name failed with an unexpected error: $($_.Exception.Message)" }
     }
 }
 
@@ -47,6 +49,10 @@ Assert-Equal 'example.com:8080' (ConvertTo-ChainlinkEntry 'example.com:8080') 'a
 Assert-Equal 'localhost:3000/app' (ConvertTo-ChainlinkEntry 'localhost:3000/app/') 'accepts localhost port with path'
 Assert-Throws { ConvertTo-ChainlinkEntry 'mailto:someone@example.com' } 'rejects schemes without slashes'
 Assert-Throws { ConvertTo-ChainlinkEntry '*' } 'rejects a bare wildcard'
+Assert-Equal 'www.com' (ConvertTo-ChainlinkEntry 'www.com') 'keeps a bare www host'
+Assert-Equal 'example.com' (ConvertTo-ChainlinkEntry 'http://example.com:443/') 'drops default ports so entries re-read the same'
+Assert-Equal 'youtube.com/channel/UC123' (ConvertTo-ChainlinkChannel 'channel/UC123') 'accepts a channel as the window shows it'
+Assert-Equal 'youtube.com/c/Name' (ConvertTo-ChainlinkChannel (ConvertTo-ChainlinkChannel 'https://www.youtube.com/c/Name/videos').Substring(12)) 'channel URL survives a round trip'
 
 $watchdogPath = 'C:\ProgramData\Chainlink\watchdog.ps1'
 $powershellPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -170,6 +176,15 @@ try {
     Assert-Equal 'youtube.com/shorts' $entries[1] 'second normalized entry'
     Set-ChainlinkTextFileAtomic -Path $blocklist -Lines @('# an intentionally empty blocklist')
     Assert-Equal 0 @(Get-ChainlinkBlocklist -Path $blocklist).Count 'accepts empty blocklist'
+    Set-ChainlinkTextFileAtomic -Path $blocklist -Lines @('# header', '', 'a.example', '')
+    Assert-Equal 4 @([IO.File]::ReadAllLines($blocklist)).Count 'writes blank lines'
+    Set-ChainlinkTextFileAtomic -Path $blocklist -Lines @('b.example')
+    Assert-Equal 'b.example' (@(Get-ChainlinkBlocklist -Path $blocklist) -join '|') 'replaces an existing file'
+    Assert-Equal 0 @(Get-ChildItem -LiteralPath $tempDirectory -Filter '.chainlink-*' -Force).Count 'leaves no temporary file'
+    Set-ChainlinkTextFileAtomic -Path $blocklist -Lines @(1..2049 | ForEach-Object { "site$_.example" })
+    Assert-Throws { Get-ChainlinkBlocklist -Path $blocklist } 'rejects more than 2,048 entries' 'more than 2048'
+    Set-ChainlinkTextFileAtomic -Path $blocklist -Lines @(('a' * 2049) + '.example')
+    Assert-Throws { Get-ChainlinkBlocklist -Path $blocklist } 'rejects an over-long entry' 'characters or fewer'
     # The watchdog lock: one holder at a time, and the holder's process id is readable.
     $lockPath = Join-Path $tempDirectory 'watchdog.lock'
     $lock = Open-ChainlinkWatchdogLock -Path $lockPath
@@ -202,6 +217,19 @@ if ($isAdmin) {
         Assert-True (-not (Test-ChainlinkProtectedDirectory $loose)) 'an ordinary directory is not protected'
         Set-ChainlinkProtectedDirectoryAcl $loose
         Assert-True (Test-ChainlinkProtectedDirectory $loose) 'repair re-applies the protected ACL'
+        # A folder a non-administrator could write to, or one holding somebody else's file, is not trusted.
+        Assert-True (Test-ChainlinkTrustedDirectory $protected) 'a protected folder is trusted'
+        $acl = [IO.Directory]::GetAccessControl($protected)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')), 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        [IO.Directory]::SetAccessControl($protected, $acl)
+        Assert-True (Test-ChainlinkTrustedDirectory $protected) 'read access for Users (original release) is still trusted'
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')), 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        [IO.Directory]::SetAccessControl($protected, $acl)
+        Assert-True (-not (Test-ChainlinkTrustedDirectory $protected)) 'write access for Users is not trusted'
+        $plain = Join-Path ([IO.Path]::GetTempPath()) ('chainlink-plain-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $plain | Out-Null
+        try { Assert-True (-not (Test-ChainlinkTrustedDirectory $plain)) 'an ordinary folder is not trusted' }
+        finally { Remove-Item -LiteralPath $plain -Recurse -Force }
     } finally {
         foreach ($path in @($protected, $loose)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
     }
@@ -218,14 +246,7 @@ New-Item -ItemType Directory -Path (Join-Path $scratch 'usb\Chainlink') | Out-Nu
 New-Item -Path $scratchRoot -Force | Out-Null
 try {
     . (Join-Path $repository 'Chainlink\watchdog.ps1')
-    $AppDir        = Join-Path $scratch 'app'
-    $PairFile      = Join-Path $AppDir 'pair.txt'
-    $BlocklistFile = Join-Path $AppDir 'blocklist.txt'
-    $AppliedFile   = Join-Path $AppDir 'applied-blocklist.txt'
-    $BaselineFile  = Join-Path $AppDir 'policy-baseline.json'
-    $LockFile      = Join-Path $AppDir 'watchdog.lock'
-    $LogFile       = Join-Path $AppDir 'log.txt'
-    $StatusFile    = Join-Path $AppDir 'status.txt'
+    Set-AppDir (Join-Path $scratch 'app')
     $PolicyRoot    = $scratchRoot
     $script:FakeUsb = $null
     function Find-Key { return $script:FakeUsb }
@@ -294,17 +315,14 @@ try {
 # ---- install, repair, and uninstall, with Task Scheduler and the watchdog child process stubbed
 if ($isAdmin) {
     $scratch = Join-Path ([IO.Path]::GetTempPath()) ('chainlink-install-' + [Guid]::NewGuid().ToString('N'))
+    $installPolicyRoot = 'HKCU:\Software\ChainlinkTests-' + [Guid]::NewGuid().ToString('N')
+    New-Item -Path $installPolicyRoot -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $scratch 'usb') | Out-Null
     Copy-Item -LiteralPath (Join-Path $repository 'Chainlink') -Destination (Join-Path $scratch 'usb') -Recurse
     try {
         . (Join-Path $scratch 'usb\Chainlink\Chainlink.ps1')
         $UsbRoot       = (Split-Path -Path $env:SystemRoot -Qualifier) + '\'   # any real volume, for its serial number
-        $AppDir        = Join-Path $scratch 'app'
-        $PairFile      = Join-Path $AppDir 'pair.txt'
-        $RecoveryFile  = Join-Path $AppDir 'recovery.txt'
-        $RecoveryAttemptsFile = Join-Path $AppDir 'recovery-attempts.txt'
-        $LockFile      = Join-Path $AppDir 'watchdog.lock'
-        $InstalledWatchdog = Join-Path $AppDir 'watchdog.ps1'
+        Set-AppDir (Join-Path $scratch 'app')
         $ShortcutPath  = Join-Path $scratch 'Chainlink Emergency Uninstall.lnk'
         $TaskName      = 'ChainlinkTests-' + [Guid]::NewGuid().ToString('N')
         $WatchdogStopTimeoutSeconds = 1
@@ -331,22 +349,28 @@ if ($isAdmin) {
             })
         }
         function Stop-LegacyWatchdogProcesses { }
+        function Test-UsbLayout { return $true }
         function Invoke-Watchdog([string]$path, [string]$mode) {
             $script:Calls.Add("watchdog $mode")
-            if ($mode -eq '-CaptureBaseline') { [IO.File]::WriteAllText((Join-Path $AppDir 'policy-baseline.json'), '{}') }
+            if ($mode -eq '-CaptureBaseline') {
+                $captured = Get-ChainlinkPolicyBaseline -Root $installPolicyRoot | ConvertTo-Json -Depth 8
+                [IO.File]::WriteAllText((Join-Path $AppDir 'policy-baseline.json'), $captured)
+            }
             return $true
         }
 
         # A folder somebody else filled must never be adopted.
         New-Item -ItemType Directory -Path $AppDir | Out-Null
         [IO.File]::WriteAllText((Join-Path $AppDir 'watchdog.ps1'), 'planted')
-        Assert-Throws { Install-Chainlink } 'refuses a pre-filled program folder with no Chainlink task'
+        Assert-Throws { Install-Chainlink } 'refuses a pre-filled program folder with no Chainlink task' 'another account'
+        Assert-Throws { Uninstall-Chainlink } 'refuses to uninstall from a folder Chainlink did not create' 'another account'
+        Assert-Equal '' ($script:Calls -join '|') 'runs nothing from an untrusted folder'
         Assert-Equal 'planted' ([IO.File]::ReadAllText((Join-Path $AppDir 'watchdog.ps1'))) 'leaves the pre-filled folder untouched'
         Remove-Item -LiteralPath $AppDir -Recurse -Force
 
         # A failed first link leaves nothing behind.
         $script:FailRegister = $true
-        Assert-Throws { Install-Chainlink } 'surfaces a Task Scheduler failure'
+        Assert-Throws { Install-Chainlink } 'surfaces a Task Scheduler failure' 'simulated'
         Assert-True (-not (Test-Path -LiteralPath $AppDir)) 'a failed first link removes the program folder'
         Assert-True (-not (Test-Path -LiteralPath $ShortcutPath)) 'a failed first link removes the shortcut'
         $script:FailRegister = $false
@@ -361,7 +385,23 @@ if ($isAdmin) {
         }
         Assert-True ((Get-Content -LiteralPath $PairFile -Raw).Trim() -match '^[a-f0-9]{64}$') 'pair file holds one hash'
         Assert-True (Test-Path -LiteralPath $ShortcutPath) 'first link creates the emergency shortcut'
-        Assert-Equal 'stop|watchdog -CaptureBaseline|register' ($script:Calls -join '|') 'first link call order'
+        Assert-Equal 'watchdog -CaptureBaseline|register' ($script:Calls -join '|') 'first link call order'
+        Assert-True (Test-BaselineFile (Join-Path $AppDir 'policy-baseline.json')) 'first link stores a usable baseline'
+
+        # The window's own save and load: blank lines, every channel form, and a second save.
+        Save-Blocklist @('https://www.Example.com/', '*.second.example') @('@SomeCreator', 'https://www.youtube.com/channel/UC123/videos', 'c/Name') $true
+        $loaded = Read-Blocklist
+        Assert-Equal 'example.com|second.example' ($loaded.Sites -join '|') 'window loads saved websites'
+        Assert-Equal '@SomeCreator|channel/UC123|c/Name' ($loaded.Channels -join '|') 'window loads saved channels'
+        Assert-True $loaded.Shorts 'window loads the Shorts switch'
+        Save-Blocklist $loaded.Sites $loaded.Channels $loaded.Shorts
+        Assert-Equal '@SomeCreator|channel/UC123|c/Name' ((Read-Blocklist).Channels -join '|') 'saved channels can be saved again'
+        Add-Content -LiteralPath $BlocklistPath -Value 'not a host name' -Encoding UTF8
+        $loaded = Read-Blocklist
+        Assert-Equal 'not a host name' ($loaded.Invalid -join '|') 'window reports an invalid line'
+        Assert-True ($loaded.Sites -contains 'not a host name') 'window keeps an invalid line visible'
+        Assert-Throws { Save-Blocklist $loaded.Sites $loaded.Channels $loaded.Shorts } 'window refuses to save an invalid line' 'whitespace'
+        Save-Blocklist @('example.com') @() $false
         Assert-True (Test-UsbMatchesPc) 'the linked USB matches this PC'
         Assert-True (Test-RecoveryWords $words) 'recovery words verify'
         $wrong = @($words); $wrong[5] = if ($words[5] -eq 'apple') { 'arrow' } else { 'apple' }
@@ -376,6 +416,18 @@ if ($isAdmin) {
         Assert-True (-not $repairWords) 'repair returns no new recovery words'
         Assert-Equal $before (Get-Content -LiteralPath $RecoveryFile -Raw) 'repair keeps the recovery record'
         Assert-Equal 'stop|watchdog -Unlock|register' ($script:Calls -join '|') 'repair call order'
+
+        # A damaged baseline is replaced during repair instead of blocking it for good.
+        [IO.File]::WriteAllText((Join-Path $AppDir 'policy-baseline.json'), '{ not json')
+        $script:Calls.Clear()
+        [void](Install-Chainlink)
+        Assert-Equal 'stop|watchdog -Unlock|watchdog -CaptureBaseline|register' ($script:Calls -join '|') 'repair recaptures a damaged baseline'
+
+        # The task is gone but the protected folder remains (interrupted uninstall): repair works.
+        $savedTasks = $script:FakeTasks; $script:FakeTasks = @()
+        $script:Calls.Clear()
+        [void](Install-Chainlink)
+        Assert-Equal 'watchdog -Unlock|register' ($script:Calls -join '|') 'repair works without the task'
 
         # While a watchdog holds the lock, uninstall must not touch anything.
         $held = Open-ChainlinkWatchdogLock -Path $LockFile
@@ -397,13 +449,23 @@ if ($isAdmin) {
             Principal = [pscustomobject]@{ UserId = 'SYSTEM' }
             Actions = @([pscustomobject]@{ Execute = 'C:\Windows\System32\cmd.exe'; Arguments = '/c exit' })
         })
-        Assert-Throws { Install-Chainlink } 'refuses to replace a foreign task of the same name'
+        Assert-Throws { Install-Chainlink } 'refuses to replace a foreign task of the same name' 'does not belong'
+        function Test-UsbLayout { return $false }
+        $script:FakeTasks = @()
+        Assert-Throws { Install-Chainlink } 'refuses to link from outside the USB Chainlink folder' 'top level'
+        $script:FakeTasks = @([pscustomobject]@{
+            Principal = [pscustomobject]@{ UserId = 'SYSTEM' }
+            Actions = @([pscustomobject]@{ Execute = 'C:\Windows\System32\cmd.exe'; Arguments = '/c exit' })
+        })
         $script:Calls.Clear()
         Remove-ChainlinkTask
         Assert-Equal '' ($script:Calls -join '|') 'leaves a foreign task alone'
     } finally {
+        if (Test-Path -LiteralPath $installPolicyRoot) { Remove-Item -LiteralPath $installPolicyRoot -Recurse -Force }
         Remove-Item -LiteralPath $scratch -Recurse -Force
     }
+} else {
+    Write-Output 'SKIP: install, repair, and uninstall checks need an elevated PowerShell.'
 }
 
 foreach ($relativePath in @('Chainlink\Chainlink.ps1', 'Chainlink\watchdog.ps1', 'Chainlink\Chainlink.Common.psm1', 'tests\PowerShell.Tests.ps1')) {

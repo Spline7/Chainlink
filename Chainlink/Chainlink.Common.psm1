@@ -70,13 +70,13 @@ function ConvertTo-ChainlinkEntry {
     $hostName = $uri.IdnHost.TrimEnd('.').ToLowerInvariant()
     if ($uri.HostNameType -eq [UriHostNameType]::IPv6) {
         $hostName = '[' + [Net.IPAddress]::Parse($uri.Host.Trim('[', ']')).ToString() + ']'
-    } elseif ($hostName.StartsWith('www.')) { $hostName = $hostName.Substring(4) }
+    } elseif ($hostName.StartsWith('www.') -and $hostName.Substring(4).Contains('.')) { $hostName = $hostName.Substring(4) }
     if ($uri.HostNameType -ne [UriHostNameType]::IPv6 -and $hostName -notmatch '^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$') {
         throw "Invalid website hostname: $Value"
     }
 
     $port = ''
-    if (-not $uri.IsDefaultPort) { $port = ":$($uri.Port)" }
+    if ($uri.Port -notin @(80, 443)) { $port = ":$($uri.Port)" }
     $path = $uri.AbsolutePath.TrimEnd('/')
     if ($path -eq '/') { $path = '' }
     return "$hostName$port$path"
@@ -88,6 +88,8 @@ function ConvertTo-ChainlinkChannel {
     $value = $Value.Trim()
     if ($value -eq '') { return '' }
     if ($value -match '^@?([a-zA-Z0-9._-]{1,100})$') { return "youtube.com/@$($Matches[1])" }
+    # The window shows saved channels without "youtube.com/", so that form must be accepted back.
+    if ($value -match '^(channel|c|user)/([a-zA-Z0-9._-]{1,128})$') { return "youtube.com/$($Matches[1])/$($Matches[2])" }
 
     $entry = ConvertTo-ChainlinkEntry $value
     $entry = $entry -replace '^m\.youtube\.com/', 'youtube.com/'
@@ -121,10 +123,26 @@ function Get-ChainlinkBlocklist {
     return $entries.ToArray()
 }
 
+# Moves a finished temporary file over its destination. ReplaceFile swaps the two in one step;
+# Move-Item -Force on Windows PowerShell 5.1 deletes the destination first, which would lose the
+# file if the process stopped in between.
+function Move-ChainlinkFileOver {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        try { [IO.File]::Replace($Source, $Destination, [NullString]::Value); return }
+        catch { }   # some removable-drive file systems cannot swap files; fall back below
+    }
+    Move-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
 function Set-ChainlinkTextFileAtomic {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines
     )
 
     $directory = Split-Path -Parent $Path
@@ -135,7 +153,7 @@ function Set-ChainlinkTextFileAtomic {
     $encoding = New-Object Text.UTF8Encoding($false)
     try {
         [IO.File]::WriteAllLines($tempPath, $Lines, $encoding)
-        Move-Item -LiteralPath $tempPath -Destination $Path -Force
+        Move-ChainlinkFileOver -Source $tempPath -Destination $Path
     } finally {
         if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
     }
@@ -220,6 +238,31 @@ function Test-ChainlinkProtectedDirectory {
     return $true
 }
 
+# True when nobody but SYSTEM and Administrators could have put or changed anything in the
+# directory: it and everything in it are owned by them, nothing in it is a link, and any other
+# account has at most read access (the original release let Users read the folder). Uninstall
+# and repair check this before they read state from, or run a script in, an existing folder.
+function Test-ChainlinkTrustedDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+    $security = [IO.Directory]::GetAccessControl($Path, ([Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access))
+    if ($security.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $script:TrustedOwnerSids) { return $false }
+    $readOnly = [Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize
+    foreach ($rule in $security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($rule.IdentityReference.Value -in $script:TrustedOwnerSids) { continue }
+        if (($rule.FileSystemRights -band (-bnot [int]$readOnly)) -ne 0) { return $false }
+    }
+    foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -Recurse)) {
+        if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        try { if ((Get-ChainlinkOwnerSid $child.FullName) -notin $script:TrustedOwnerSids) { return $false } }
+        catch [IO.FileNotFoundException] { continue }
+    }
+    return $true
+}
+
 # Creates the directory with its final owner and ACL in one step, so there is no moment at which
 # another account can put files into it. Fails if anything already exists at the path.
 function New-ChainlinkProtectedDirectory {
@@ -253,7 +296,9 @@ function Set-ChainlinkProtectedDirectoryAcl {
     if (-not (Test-ChainlinkProtectedDirectory $Path)) { throw "Could not secure $Path." }
     foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -Recurse)) {
         if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$($child.FullName) is a link; remove it and try again." }
-        if ((Get-ChainlinkOwnerSid $child.FullName) -notin $script:TrustedOwnerSids) {
+        try { $childOwner = Get-ChainlinkOwnerSid $child.FullName }
+        catch [IO.FileNotFoundException] { continue }   # a temporary file that has since been renamed
+        if ($childOwner -notin $script:TrustedOwnerSids) {
             throw "$($child.FullName) is owned by an account other than SYSTEM or Administrators; remove it and try again."
         }
     }
@@ -503,24 +548,31 @@ function Set-ChainlinkPolicyLock {
 
     $Entries = @($Entries | Where-Object { -not [string]::IsNullOrEmpty($_) })
     $managedEntries = @(Merge-ChainlinkValues $Entries $PreviousEntries)
+    $firstError = $null
     foreach ($target in @(Get-ChainlinkPolicyTargets $Root)) {
-        $wanted = @($Entries)
-        $managed = $managedEntries
-        if ($target.Firefox) {
-            $wanted = @(Get-ChainlinkFirefoxPatterns $Entries)
-            $managed = @(Get-ChainlinkFirefoxPatterns $managedEntries)
-        }
-        $listKey = Join-Path $target.Key $target.List
-        $managedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-        foreach ($value in $managed) { [void]$managedSet.Add($value) }
-        $others = @(Get-ChainlinkListValues $listKey | Where-Object { -not $managedSet.Contains($_) })
-        $base = @(Get-ChainlinkBaselineList $Baseline $target.Name)
-        Set-ChainlinkListValues $listKey @(Merge-ChainlinkValues $base $others $wanted)
-        if (-not (Test-Path -LiteralPath $target.Key)) { New-Item -Path $target.Key -Force | Out-Null }
-        foreach ($name in $target.Values.Keys) {
-            New-ItemProperty -LiteralPath $target.Key -Name $name -Value ([int]$target.Values[$name]) -PropertyType DWord -Force | Out-Null
+        # A failure on one browser must not leave the others unblocked.
+        try {
+            $wanted = @($Entries)
+            $managed = $managedEntries
+            if ($target.Firefox) {
+                $wanted = @(Get-ChainlinkFirefoxPatterns $Entries)
+                $managed = @(Get-ChainlinkFirefoxPatterns $managedEntries)
+            }
+            $listKey = Join-Path $target.Key $target.List
+            $managedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+            foreach ($value in $managed) { [void]$managedSet.Add($value) }
+            $others = @(Get-ChainlinkListValues $listKey | Where-Object { -not $managedSet.Contains($_) })
+            $base = @(Get-ChainlinkBaselineList $Baseline $target.Name)
+            Set-ChainlinkListValues $listKey @(Merge-ChainlinkValues $base $others $wanted)
+            if (-not (Test-Path -LiteralPath $target.Key)) { New-Item -Path $target.Key -Force | Out-Null }
+            foreach ($name in $target.Values.Keys) {
+                New-ItemProperty -LiteralPath $target.Key -Name $name -Value ([int]$target.Values[$name]) -PropertyType DWord -Force | Out-Null
+            }
+        } catch {
+            if ($null -eq $firstError) { $firstError = $_ }
         }
     }
+    if ($null -ne $firstError) { throw $firstError }
 }
 
 # Lifts the block: removes exactly the entries Chainlink manages, keeps everything else, and
@@ -583,10 +635,12 @@ Export-ModuleMember -Function @(
     'ConvertTo-ChainlinkChannel',
     'Get-ChainlinkBlocklist',
     'Set-ChainlinkTextFileAtomic',
+    'Move-ChainlinkFileOver',
     'Test-ChainlinkScheduledTaskObject',
     'Test-ChainlinkTaskReferencesDirectory',
     'Get-ChainlinkOwnerSid',
     'Test-ChainlinkProtectedDirectory',
+    'Test-ChainlinkTrustedDirectory',
     'New-ChainlinkProtectedDirectory',
     'Set-ChainlinkProtectedDirectoryAcl',
     'Open-ChainlinkWatchdogLock',

@@ -7,7 +7,7 @@ Chainlink is a small, open-source website blocker for Windows 10 and 11 that use
 
 It's meant to add friction, not to be unbreakable. If you lose the USB, your accountability partner's recovery words let you uninstall it. Someone with admin rights and technical know-how could still remove it by hand.
 
-**Privacy:** Chainlink makes no network requests and has no telemetry, accounts, or cloud services. It is plain-text PowerShell that you can read in Notepad.
+**Privacy:** Chainlink makes no network requests and has no telemetry, accounts, or cloud services. The Rust source and its locked dependency graph are included in this repository.
 
 ---
 
@@ -15,10 +15,9 @@ It's meant to add friction, not to be unbreakable. If you lose the USB, your acc
 
 ```
 Chainlink.cmd            <- double-click this
+build-usb.cmd            <- build the executable on Windows after cloning
 Chainlink\
-    Chainlink.ps1        the Chainlink window: edit blocklist / link / uninstall
-    Chainlink.Common.psm1 shared validation and cryptographic helpers
-    watchdog.ps1         background checker (copied to the PC when you link it)
+    chainlink.exe        settings UI and watchdog (created by build-usb.cmd)
     blocklist.txt        the sites you want blocked
     chainlink.key        your secret key (created on first link, hidden, never share it)
 ```
@@ -86,18 +85,17 @@ If your partner loses the words, plug in your USB, open Chainlink, and click **N
 ## How it works
 
 - **Linking** creates a random secret (`chainlink.key`) on the USB. The PC stores only a SHA-256 hash of that secret combined with the USB's volume serial number, so copying the key file to a different drive doesn't work.
-- A **scheduled task** named `Chainlink` runs `C:\ProgramData\Chainlink\watchdog.ps1` as SYSTEM. It starts at boot, and Task Scheduler restarts it within a minute if it's stopped.
+- A **scheduled task** named `Chainlink` runs `C:\ProgramData\Chainlink\chainlink.exe --watchdog` as SYSTEM. It starts at boot, retries failures, and starts again within a minute if it is stopped.
 - Every **5 seconds** the watchdog checks the connected drives for a valid key:
   - **Not found:** it writes the blocklist into the browsers' policy settings in the registry (`URLBlocklist` for Chrome/Edge/Brave, `WebsiteFilter` for Firefox). It also turns off Incognito/InPrivate, guest mode, and adding profiles. About once a minute it checks whether those settings were changed and puts them back.
   - **Found:** it removes those settings and copies `blocklist.txt` from the USB if the file changed.
 - Only SYSTEM and Administrators can modify `C:\ProgramData\Chainlink`.
-- **Recovery words** are 6 words picked at random from a built-in list of 256. The PC stores only a salted, slow hash of them (PBKDF2, 100,000 rounds), never the words themselves.
-- New installations use 300,000 PBKDF2 rounds and a versioned recovery record. Existing 100,000-round records remain usable until you choose **New recovery words**.
+- **Recovery words** are 6 words picked at random from a built-in list of 256. New records use salted PBKDF2-HMAC-SHA256 with 300,000 rounds. Existing PowerShell recovery records remain usable until you choose **New recovery words**.
 - Invalid key files, unreadable state, and watchdog-cycle errors fail closed: Chainlink tries to apply the blocklist and records the error in `C:\ProgramData\Chainlink\log.txt`.
 
 ## Update or repair an installation
 
-Run `Chainlink.cmd` from the paired USB and click **Repair / update this PC**. This refreshes the installed scripts and scheduled task without replacing your recovery words or the pre-install browser-policy snapshot. The first update from the original release creates that snapshot while the paired USB has the old watchdog unlocked.
+Run `Chainlink.cmd` from the paired USB and click **Repair / update this PC**. This refreshes the installed executable and scheduled task without replacing your recovery words or the pre-install browser-policy snapshot. The first update from the original release creates that snapshot while the paired USB has the old watchdog unlocked.
 
 ## Troubleshooting
 
@@ -108,13 +106,21 @@ Run `Chainlink.cmd` from the paired USB and click **Repair / update this PC**. T
 
 ## Development
 
-The production scripts support Windows PowerShell 5.1 (the version included with Windows 10 and 11). Run the dependency-free checks from a PowerShell prompt:
+Install the stable MSVC Rust toolchain, then build the USB executable on Windows:
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\PowerShell.Tests.ps1
+```console
+build-usb.cmd
 ```
 
-The tests parse every PowerShell file and exercise URL/channel normalization, rejection cases, hashing, constant-time comparison, atomic writes, and blocklist limits/deduplication. See [SECURITY.md](SECURITY.md) for the threat model and responsible-reporting guidance.
+Cross-platform core checks and linting are:
+
+```console
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+```
+
+The test suite covers URL/channel normalization, rejection cases, legacy recovery compatibility, atomic writes, and blocklist limits/deduplication. The Windows validation also builds the release executable and has Task Scheduler parse a disabled generated task definition. See [SECURITY.md](SECURITY.md) for the threat model and responsible-reporting guidance.
 
 ## License
 

@@ -6,7 +6,7 @@ Chainlink is an accountability aid. With the paired USB absent, it should reliab
 
 ## Trust boundaries
 
-- The scripts on the paired USB and the person who controls that USB are trusted.
+- The executable/source on the paired USB and the person who controls that USB are trusted.
 - `C:\ProgramData\Chainlink` is writable only by SYSTEM and Administrators after installation.
 - The watchdog and scheduled task run as SYSTEM because machine-wide browser policy requires elevation.
 - Browser policy, Task Scheduler, the Windows registry, volume serial numbers, and Windows cryptography are trusted operating-system services.

@@ -59,7 +59,7 @@ function ConvertTo-ChainlinkEntry {
 
     $hostName = $uri.IdnHost.TrimEnd('.').ToLowerInvariant()
     if ($uri.HostNameType -eq [UriHostNameType]::IPv6) {
-        $hostName = '[' + $hostName.Trim('[', ']') + ']'
+        $hostName = '[' + $uri.Host.Trim('[', ']') + ']'
     } elseif ($hostName.StartsWith('www.')) { $hostName = $hostName.Substring(4) }
     if ($uri.HostNameType -ne [UriHostNameType]::IPv6 -and $hostName -notmatch '^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$') {
         throw "Invalid website hostname: $Value"

@@ -90,7 +90,7 @@ function Get-ChainlinkBlocklist {
 
     $entries = New-Object 'System.Collections.Generic.List[string]'
     $seen = @{}
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return ,([string[]]@()) }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
 
     foreach ($line in [IO.File]::ReadLines($Path)) {
         $trimmed = $line.Trim()
@@ -105,7 +105,7 @@ function Get-ChainlinkBlocklist {
             $entries.Add($entry)
         }
     }
-    return ,$entries.ToArray()
+    return $entries.ToArray()
 }
 
 function Set-ChainlinkTextFileAtomic {

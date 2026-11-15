@@ -61,13 +61,13 @@ function Get-ValueSnapshot {
 
 function Get-ListSnapshot {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
     $key = Get-Item -LiteralPath $Path
     $values = @()
     foreach ($name in $key.GetValueNames()) {
         $values += [pscustomobject]@{ Name = $name; Value = [string]$key.GetValue($name, $null, 'DoNotExpandEnvironmentNames'); Kind = $key.GetValueKind($name).ToString() }
     }
-    return ,$values
+    return $values
 }
 
 function Save-Baseline {
@@ -126,7 +126,7 @@ function Get-UniqueStrings {
         $text = [string]$value
         if ($text -ne '' -and -not $seen.ContainsKey($text)) { $seen[$text] = $true; $result.Add($text) }
     }
-    return ,$result.ToArray()
+    return $result.ToArray()
 }
 
 function Set-ListValues {
@@ -141,8 +141,8 @@ function Set-ListValues {
 
 function Get-BaselineListValues {
     param($Snapshot)
-    if ($null -eq $Snapshot) { return ,@() }
-    return ,@($Snapshot | ForEach-Object { [string]$_.Value })
+    if ($null -eq $Snapshot) { return }
+    return @($Snapshot | ForEach-Object { [string]$_.Value })
 }
 
 function Restore-Property {
@@ -162,7 +162,7 @@ function Get-UnmanagedCurrentValues {
     param([string]$Path, [string[]]$ManagedValues)
     $managed = @{}
     foreach ($value in $ManagedValues) { $managed[$value] = $true }
-    return ,@(Get-ListSnapshot $Path | ForEach-Object { [string]$_.Value } | Where-Object { -not $managed.ContainsKey($_) })
+    return @(Get-ListSnapshot $Path | ForEach-Object { [string]$_.Value } | Where-Object { -not $managed.ContainsKey($_) })
 }
 
 function Set-Lock {

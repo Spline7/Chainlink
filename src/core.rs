@@ -32,22 +32,36 @@ pub fn normalize_entry(input: &str) -> Result<String> {
     {
         bail!("entries cannot contain whitespace or control characters");
     }
-    if let Some((scheme, _)) = value.split_once("://")
-        && !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
-    {
-        bail!("only http:// and https:// URLs are supported");
+    // "example.com:8080" is a host and port; "mailto:someone" or "file:///C:/" is another scheme.
+    let scheme_end = value.find("://").filter(|end| is_scheme(&value[..*end]));
+    let rest = match scheme_end {
+        Some(end) => {
+            if !matches!(value[..end].to_ascii_lowercase().as_str(), "http" | "https") {
+                bail!("only http:// and https:// URLs are supported");
+            }
+            &value[end + 3..]
+        }
+        None => {
+            if let Some((prefix, after)) = value.split_once(':')
+                && is_scheme(prefix)
+                && !is_port_and_path(after)
+            {
+                bail!("only http:// and https:// URLs are supported");
+            }
+            value
+        }
+    };
+    // The original release accepted "*.example.com" and "example.com/*"; both mean the plain entry.
+    let rest = rest
+        .strip_prefix("*.")
+        .unwrap_or(rest)
+        .trim_end_matches(['/', '*']);
+    if rest.is_empty() {
+        bail!("invalid website or URL");
     }
-    if !value.contains("://")
-        && let Some((prefix, _)) = value.split_once(':')
-        && prefix.chars().all(|c| c.is_ascii_alphabetic())
-    {
-        bail!("only http:// and https:// URLs are supported");
-    }
-
-    let candidate = if value.contains("://") {
-        value.to_owned()
-    } else {
-        format!("https://{value}")
+    let candidate = match scheme_end {
+        Some(end) => format!("{}{rest}", &value[..end + 3]),
+        None => format!("https://{rest}"),
     };
     let url = Url::parse(&candidate).context("invalid website or URL")?;
     if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
@@ -61,7 +75,13 @@ pub fn normalize_entry(input: &str) -> Result<String> {
     }
 
     let mut host = match url.host().context("invalid website hostname")? {
-        Host::Domain(domain) => domain.trim_end_matches('.').to_ascii_lowercase(),
+        Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            if !domain.split('.').all(is_host_label) {
+                bail!("invalid website hostname");
+            }
+            domain
+        }
         Host::Ipv4(address) => address.to_string(),
         Host::Ipv6(address) => format!("[{address}]"),
     };
@@ -76,6 +96,30 @@ pub fn normalize_entry(input: &str) -> Result<String> {
     };
     let path = url.path().trim_end_matches('/');
     Ok(format!("{host}{port}{path}"))
+}
+
+fn is_scheme(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+}
+
+/// True for "8080" or "8080/path": what follows the colon in "host:port".
+fn is_port_and_path(value: &str) -> bool {
+    let port = value.split('/').next().unwrap_or("");
+    (1..=5).contains(&port.len()) && port.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_host_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 pub fn normalize_channel(input: &str) -> Result<String> {
@@ -148,9 +192,25 @@ pub fn parse_blocklist(text: &str) -> Result<Vec<String>> {
     Ok(entries)
 }
 
-pub fn read_blocklist(path: &Path) -> Result<Vec<String>> {
-    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+pub fn parse_blocklist_bytes(bytes: &[u8]) -> Result<Vec<String>> {
+    let text = std::str::from_utf8(bytes).context("the blocklist is not UTF-8 text")?;
     parse_blocklist(text.trim_start_matches('\u{feff}'))
+}
+
+pub fn read_blocklist(path: &Path) -> Result<Vec<String>> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    parse_blocklist_bytes(&bytes)
+}
+
+/// Ordered union of any number of string lists, without empty strings.
+pub fn merge(groups: &[&[String]]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|value| !value.is_empty() && seen.insert(value.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
@@ -264,6 +324,10 @@ fn verify_recovery_record_inner(record: &str, words: &[String]) -> Result<bool> 
 }
 
 pub fn firefox_patterns(entry: &str) -> Vec<String> {
+    if entry == "*" {
+        // the watchdog's block-everything fail-safe
+        return vec!["*://*/*".to_owned()];
+    }
     match entry.split_once('/') {
         None => vec![format!("*://{entry}/*"), format!("*://*.{entry}/*")],
         Some((host, path)) => {
@@ -318,12 +382,43 @@ mod tests {
     }
 
     #[test]
+    fn accepts_ports_and_legacy_wildcards() {
+        for (input, expected) in [
+            ("*.example.com", "example.com"),
+            ("https://example.com/videos/*", "example.com/videos"),
+            ("example.com:8080", "example.com:8080"),
+            ("localhost:3000/app/", "localhost:3000/app"),
+            ("Example.com/Path/", "example.com/Path"),
+        ] {
+            assert_eq!(normalize_entry(input).unwrap(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn merge_and_patterns() {
+        let one = vec!["a.example".to_owned()];
+        let two = vec!["x.example".to_owned(), "y.example".to_owned()];
+        assert_eq!(
+            merge(&[&one, &one, &two]),
+            ["a.example", "x.example", "y.example"]
+        );
+        assert!(merge(&[&[], &[String::new()]]).is_empty());
+        assert_eq!(firefox_patterns("*"), ["*://*/*"]);
+        assert!(firefox_patterns("example.com").contains(&"*://*.example.com/*".to_owned()));
+    }
+
+    #[test]
     fn rejects_ambiguous_input() {
         for value in [
             "file:///C:/Windows",
             "https://user:pass@example.com",
             "https://example.com/?secret=x",
             "bad host",
+            "mailto:someone@example.com",
+            "javascript:alert(1)",
+            "*",
+            "exa_mple.com",
+            "*.*.example.com",
         ] {
             assert!(normalize_entry(value).is_err(), "{value}");
         }

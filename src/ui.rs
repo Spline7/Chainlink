@@ -1,11 +1,14 @@
 use anyhow::Result;
-use chainlink_blocker::core::{
-    SHORTS_ENTRY, atomic_write, normalize_channel, normalize_entry, read_blocklist,
-};
-use chainlink_blocker::windows;
+use chainlink_blocker::core::{SHORTS_ENTRY, atomic_write, normalize_channel, normalize_entry};
+use chainlink_blocker::windows::{Env, Scheduler};
 use native_windows_gui as nwg;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
+
+/// How long install and uninstall wait for a running watchdog to stop.
+const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn confirm(parent: &nwg::Window, content: &str) -> bool {
     nwg::modal_message(
@@ -23,24 +26,42 @@ fn show_error(parent: &nwg::Window, context: &str, error: &anyhow::Error) {
     nwg::modal_error_message(parent, "Chainlink", &format!("{context}:\r\n{error:#}"));
 }
 
+/// Shows new recovery words and does not go away until the user confirms they were passed on,
+/// so the words cannot be skipped by accident.
 fn show_words(parent: &nwg::Window, words: &[String]) {
-    nwg::modal_info_message(
-        parent,
-        "Chainlink - recovery words",
-        &format!(
-            "Give these words to your accountability partner. They will not be shown again.\r\n\r\n{}",
-            words
-                .iter()
-                .enumerate()
-                .map(|(index, word)| format!("{}. {word}", index + 1))
-                .collect::<Vec<_>>()
-                .join("    ")
-        ),
+    let list = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| format!("{}. {word}", index + 1))
+        .collect::<Vec<_>>()
+        .join("    ");
+    let content = format!(
+        "Give these words to your accountability partner and don't keep a copy yourself. \
+         They are the only way to remove Chainlink from this PC if the USB key is lost, \
+         and they will not be shown again.\r\n\r\n{list}\r\n\r\n\
+         Does your accountability partner have these words now?"
     );
+    loop {
+        let choice = nwg::modal_message(
+            parent,
+            &nwg::MessageParams {
+                title: "Chainlink - recovery words",
+                content: &content,
+                buttons: nwg::MessageButtons::YesNo,
+                icons: nwg::MessageIcons::Info,
+            },
+        );
+        if choice == nwg::MessageChoice::Yes {
+            return;
+        }
+    }
 }
 
 struct SettingsApp {
+    env: Env,
     usb_dir: PathBuf,
+    /// The window contents as last loaded or saved, to notice unsaved edits on close.
+    saved: RefCell<String>,
     window: nwg::Window,
     title: nwg::Label,
     status: nwg::Label,
@@ -56,9 +77,11 @@ struct SettingsApp {
 }
 
 impl SettingsApp {
-    fn build(usb_dir: PathBuf) -> Result<Rc<Self>> {
+    fn build(env: Env, usb_dir: PathBuf) -> Result<(Rc<Self>, Vec<String>)> {
         let mut app = Self {
+            env,
             usb_dir,
+            saved: RefCell::new(String::new()),
             window: Default::default(),
             title: Default::default(),
             status: Default::default(),
@@ -146,21 +169,44 @@ impl SettingsApp {
             .parent(&app.window)
             .build(&mut app.words)?;
         let app = Rc::new(app);
-        app.load()?;
+        let invalid = app.load();
         app.update_status();
-        Ok(app)
+        Ok((app, invalid))
+    }
+
+    fn snapshot(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.sites.text(),
+            self.channels.text(),
+            self.shorts.check_state() == nwg::CheckBoxState::Checked
+        )
     }
 
     fn source_blocklist(&self) -> PathBuf {
         self.usb_dir.join("blocklist.txt")
     }
 
-    fn load(&self) -> Result<()> {
-        let entries = read_blocklist(&self.source_blocklist())?;
+    /// Fills the window from blocklist.txt and returns the lines that are not valid. Such a
+    /// line is shown as written so it can be fixed; it is never dropped.
+    fn load(&self) -> Vec<String> {
+        let text = std::fs::read(self.source_blocklist())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
         let mut sites = Vec::new();
         let mut channels = Vec::new();
+        let mut invalid = Vec::new();
         let mut shorts = false;
-        for entry in entries {
+        for line in text.trim_start_matches('\u{feff}').lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Ok(entry) = normalize_entry(line) else {
+                sites.push(line.to_owned());
+                invalid.push(line.to_owned());
+                continue;
+            };
             if entry.eq_ignore_ascii_case(SHORTS_ENTRY) {
                 shorts = true;
             } else if [
@@ -173,7 +219,7 @@ impl SettingsApp {
             .any(|prefix| entry.starts_with(prefix))
             {
                 channels.push(entry.trim_start_matches("youtube.com/").to_owned());
-            } else {
+            } else if !sites.contains(&entry) {
                 sites.push(entry);
             }
         }
@@ -184,7 +230,8 @@ impl SettingsApp {
         } else {
             nwg::CheckBoxState::Unchecked
         });
-        Ok(())
+        *self.saved.borrow_mut() = self.snapshot();
+        invalid
     }
 
     fn save_blocklist(&self) -> Result<()> {
@@ -231,11 +278,15 @@ impl SettingsApp {
             &self.source_blocklist(),
             format!("{}\n", lines.join("\n")).as_bytes(),
         )?;
-        self.load()
+        self.load();
+        Ok(())
     }
 
     fn update_status(&self) {
-        let installed = windows::genuine_task() || windows::installed_exe().is_file();
+        let installed = self.env.genuine_task(&Scheduler)
+            || ["chainlink.exe", "watchdog.ps1", "watchdog.py"]
+                .iter()
+                .any(|name| self.env.file(name).is_file());
         if !installed {
             self.status
                 .set_text("This PC is not linked. Click Link this PC to start.");
@@ -243,7 +294,7 @@ impl SettingsApp {
             self.link.set_enabled(true);
             self.uninstall.set_enabled(false);
             self.words.set_enabled(false);
-        } else if windows::usb_matches_pc(&self.usb_dir) {
+        } else if self.env.usb_matches_pc(&self.usb_dir) {
             self.status
                 .set_text("This PC is linked to this USB. Blocks are off while it is plugged in.");
             self.link.set_text("Repair / update this PC");
@@ -274,7 +325,13 @@ impl SettingsApp {
             show_error(&self.window, "Could not save the blocklist", &error);
             return;
         }
-        match windows::install(&self.usb_dir) {
+        let installed = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| {
+                self.env
+                    .install(&Scheduler, &self.usb_dir, &exe, STOP_TIMEOUT)
+            });
+        match installed {
             Ok(words) => {
                 self.update_status();
                 if let Some(words) = words {
@@ -297,7 +354,7 @@ impl SettingsApp {
         ) {
             return;
         }
-        match windows::uninstall() {
+        match self.env.uninstall(&Scheduler, STOP_TIMEOUT) {
             Ok(()) => {
                 self.update_status();
                 nwg::modal_info_message(&self.window, "Chainlink", "Chainlink has been removed.");
@@ -307,24 +364,60 @@ impl SettingsApp {
     }
 
     fn words_clicked(&self) {
-        if !confirm(&self.window, "Replace the current recovery words?") {
+        if !confirm(
+            &self.window,
+            "Make new recovery words for this PC? The old words will stop working, so your partner will need the new ones.",
+        ) {
             return;
         }
-        match windows::replace_recovery_words() {
+        match self.env.replace_recovery_words() {
             Ok(words) => show_words(&self.window, &words),
             Err(error) => show_error(&self.window, "Could not replace recovery words", &error),
         }
     }
 }
 
-pub fn run_settings(usb_dir: PathBuf) -> Result<()> {
+impl SettingsApp {
+    /// Offers to save unsaved edits. Returns false when the window should stay open.
+    fn may_close(&self) -> bool {
+        if self.snapshot() == *self.saved.borrow() {
+            return true;
+        }
+        let choice = nwg::modal_message(
+            &self.window,
+            &nwg::MessageParams {
+                title: "Chainlink",
+                content: "Save your blocklist changes before closing?",
+                buttons: nwg::MessageButtons::YesNoCancel,
+                icons: nwg::MessageIcons::Question,
+            },
+        );
+        match choice {
+            nwg::MessageChoice::No => true,
+            nwg::MessageChoice::Yes => match self.save_blocklist() {
+                Ok(()) => true,
+                Err(error) => {
+                    show_error(&self.window, "Could not save the blocklist", &error);
+                    false
+                }
+            },
+            _ => false,
+        }
+    }
+}
+
+pub fn run_settings(env: Env, usb_dir: PathBuf) -> Result<()> {
     nwg::init()?;
     nwg::Font::set_global_family("Segoe UI")?;
-    let app = SettingsApp::build(usb_dir)?;
+    let (app, invalid) = SettingsApp::build(env, usb_dir)?;
     let events = Rc::clone(&app);
-    let handler = nwg::full_bind_event_handler(&app.window.handle, move |event, _, handle| {
+    let handler = nwg::full_bind_event_handler(&app.window.handle, move |event, data, handle| {
         if event == nwg::Event::OnWindowClose && handle == events.window.handle {
-            nwg::stop_thread_dispatch();
+            if events.may_close() {
+                nwg::stop_thread_dispatch();
+            } else if let nwg::EventData::OnWindowClose(close) = data {
+                close.close(false);
+            }
         } else if event == nwg::Event::OnButtonClick {
             if handle == events.save.handle {
                 events.save_clicked();
@@ -337,12 +430,33 @@ pub fn run_settings(usb_dir: PathBuf) -> Result<()> {
             }
         }
     });
+    if !invalid.is_empty() {
+        let shown = invalid
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        nwg::modal_message(
+            &app.window,
+            &nwg::MessageParams {
+                title: "Chainlink",
+                content: &format!(
+                    "blocklist.txt has lines Chainlink cannot use. They are shown as written in the website box; \
+                     fix or delete them, then save. Until then this PC keeps using the last good list.\r\n\r\n{shown}"
+                ),
+                buttons: nwg::MessageButtons::Ok,
+                icons: nwg::MessageIcons::Warning,
+            },
+        );
+    }
     nwg::dispatch_thread_events();
     nwg::unbind_event_handler(&handler);
     Ok(())
 }
 
 struct EmergencyApp {
+    env: Env,
     window: nwg::Window,
     title: nwg::Label,
     hint: nwg::Label,
@@ -353,8 +467,9 @@ struct EmergencyApp {
 }
 
 impl EmergencyApp {
-    fn build() -> Result<Rc<Self>> {
+    fn build(env: Env) -> Result<Rc<Self>> {
         let mut app = Self {
+            env,
             window: Default::default(),
             title: Default::default(),
             hint: Default::default(),
@@ -404,7 +519,7 @@ impl EmergencyApp {
     }
 
     fn attempt(&self) {
-        let delay = windows::recovery_delay();
+        let delay = self.env.recovery_delay();
         if delay > 0 {
             self.status
                 .set_text(&format!("Please wait {delay} seconds before trying again."));
@@ -420,8 +535,8 @@ impl EmergencyApp {
             self.status.set_text("Please fill in all six words.");
             return;
         }
-        if !windows::verify_recovery(&words) {
-            let _ = windows::register_recovery_failure();
+        if !self.env.verify_recovery(&words) {
+            let _ = self.env.register_recovery_failure();
             self.status
                 .set_text("Those words do not match. Check spelling and order.");
             return;
@@ -432,8 +547,8 @@ impl EmergencyApp {
         ) {
             return;
         }
-        windows::clear_recovery_failures();
-        match windows::uninstall() {
+        self.env.clear_recovery_failures();
+        match self.env.uninstall(&Scheduler, STOP_TIMEOUT) {
             Ok(()) => {
                 nwg::modal_info_message(&self.window, "Chainlink", "Chainlink has been removed.");
                 nwg::stop_thread_dispatch();
@@ -443,15 +558,18 @@ impl EmergencyApp {
     }
 }
 
-pub fn run_emergency() -> Result<()> {
-    if !windows::recovery_file().is_file() {
+pub fn run_emergency(env: Env) -> Result<()> {
+    if !env.app_dir.is_dir() {
+        anyhow::bail!("Chainlink is not installed on this PC");
+    }
+    if !env.file("recovery.txt").is_file() {
         anyhow::bail!(
             "this installation has no recovery words; repair it with the paired USB first"
         );
     }
     nwg::init()?;
     nwg::Font::set_global_family("Segoe UI")?;
-    let app = EmergencyApp::build()?;
+    let app = EmergencyApp::build(env)?;
     let events = Rc::clone(&app);
     let handler = nwg::full_bind_event_handler(&app.window.handle, move |event, _, handle| {
         if event == nwg::Event::OnWindowClose && handle == events.window.handle

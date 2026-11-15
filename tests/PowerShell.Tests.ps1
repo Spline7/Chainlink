@@ -25,7 +25,8 @@ function Assert-Throws([scriptblock]$Action, [string]$Name) {
 }
 
 Assert-Equal 'example.com/path' (ConvertTo-ChainlinkEntry ' HTTPS://WWW.Example.COM/path/ ') 'normalizes URL'
-Assert-Equal 'xn--bcher-kva.example' (ConvertTo-ChainlinkEntry 'https://bücher.example') 'normalizes IDN'
+$idnUrl = 'https://b{0}cher.example' -f [char]0x00fc
+Assert-Equal 'xn--bcher-kva.example' (ConvertTo-ChainlinkEntry $idnUrl) 'normalizes IDN'
 Assert-Equal 'youtube.com/@SomeCreator' (ConvertTo-ChainlinkChannel '@SomeCreator') 'normalizes channel handle'
 Assert-Equal 'youtube.com/channel/UC123' (ConvertTo-ChainlinkChannel 'https://youtube.com/channel/UC123/videos') 'normalizes channel URL'
 Assert-Throws { ConvertTo-ChainlinkEntry 'file:///C:/Windows' } 'rejects non-web schemes'

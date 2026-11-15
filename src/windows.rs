@@ -25,7 +25,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetWindowsDirectoryW};
-use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramData, IsUserAnAdmin, SHGetKnownFolderPath, ShellExecuteW,
@@ -997,13 +997,6 @@ pub fn acquire_watchdog_mutex() -> Result<HANDLE> {
     Ok(handle)
 }
 
-pub fn release_watchdog_mutex(handle: HANDLE) {
-    unsafe {
-        ReleaseMutex(handle);
-        CloseHandle(handle);
-    }
-}
-
 pub fn watchdog() -> Result<()> {
     let _mutex = match acquire_watchdog_mutex() {
         Ok(handle) => handle,
@@ -1024,7 +1017,7 @@ pub fn watchdog() -> Result<()> {
                     log("Paired key found - blocks lifted.");
                 }
                 sync_blocklist(&root)?;
-            } else if state != "locked" || (tick.is_multiple_of(12) && !lock_intact()) {
+            } else if state != "locked" || (tick % 12 == 0 && !lock_intact()) {
                 set_lock()?;
                 log(if state == "locked" {
                     "Blocks changed outside Chainlink - re-applied."

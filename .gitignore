@@ -1,0 +1,7 @@
+# Per-USB secret and local artifacts
+Chainlink/chainlink.key
+*.tmp
+*.log
+target/
+Chainlink/chainlink.exe
+__pycache__/
